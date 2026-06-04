@@ -35,6 +35,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 import tempfile
 import time
 from contextlib import contextmanager
@@ -44,6 +45,15 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from hermes_constants import get_hermes_home
 from tools.registry import registry, tool_error, tool_result
+
+# fcntl is POSIX-only; on Windows it's unavailable.
+if sys.platform != "win32":
+    try:
+        import fcntl
+    except ImportError:
+        fcntl = None
+else:
+    fcntl = None
 
 if TYPE_CHECKING:
     from agent.letta_memory import LettaMemorySystem
@@ -563,7 +573,7 @@ def memory_compat(
     """
     system = get_memory_system()
     if system is None:
-        return tool_error("Memory system not initialized")
+        return tool_error("Memory system not available", success=False)
 
     action = (action or "").strip().lower()
     target = (target or "memory").strip().lower()
@@ -798,6 +808,8 @@ LEGACY_MEMORY_SCHEMA = {
         "[Legacy] Save durable information to persistent memory. This tool is "
         "a backward-compatible adapter; prefer the dedicated core_memory_*, "
         "recall_memory_*, and archival_memory_* tools when available.\n\n"
+        "Do NOT save task progress or temporary task state — use "
+        "session_search to recall prior conversation context instead.\n\n"
         "TARGETS:\n"
         "- 'memory' -> agent's persona block\n"
         "- 'user'   -> user profile (human) block\n\n"
@@ -809,7 +821,7 @@ LEGACY_MEMORY_SCHEMA = {
         "properties": {
             "action": {
                 "type": "string",
-                "enum": ["add", "replace", "remove", "read"],
+                "enum": ["add", "replace", "remove"],
                 "description": "The action to perform.",
             },
             "target": {
@@ -954,7 +966,69 @@ registry.register(
 # Backward-compatible shims for legacy test API
 # ---------------------------------------------------------------------------
 MEMORY_SCHEMA = LEGACY_MEMORY_SCHEMA
-memory_tool = memory_compat
+
+
+def memory_tool(action: str, target: str = "memory", content: str = "",
+                old_content: str = "", old_text: str = "",
+                task_id: Optional[str] = None, store: Any = None,
+                **_kwargs) -> str:
+    """Backward-compatible ``memory`` tool dispatcher.
+
+    Wraps :func:`memory_compat` and adds legacy ``store`` parameter support.
+    When ``store`` is provided (old test API), operations are performed
+    directly on the :class:`MemoryStore` instance instead of routing
+    through the Letta memory system.
+    """
+    if store is not None:
+        # Legacy MemoryStore-based path for tests
+        return _memory_store_dispatch(store, action=action, target=target,
+                                      content=content, old_content=old_content or old_text)
+    return memory_compat(action=action, target=target, content=content,
+                         old_content=old_content or old_text, task_id=task_id)
+
+
+def _memory_store_dispatch(store: "MemoryStore", action: str, target: str = "memory",
+                           content: str = "", old_content: str = "") -> str:
+    """Dispatch memory operations directly on a MemoryStore instance."""
+    action = (action or "").strip().lower()
+    target = (target or "memory").strip().lower()
+    if target not in {"memory", "user"}:
+        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+
+    if action == "read":
+        entries = store._entries_for(target)
+        return tool_result(success=True, target=target, entries=entries)
+
+    if action == "add":
+        if not content:
+            return tool_error("content is required for 'add' action", success=False)
+        result = store.add(target, content)
+        if result.get("success"):
+            return tool_result(success=True, target=target,
+                               entries=store._entries_for(target))
+        return tool_error(result.get("error", "add failed"), success=False)
+
+    if action == "replace":
+        if not old_content:
+            return tool_error("old_content is required for 'replace' action", success=False)
+        if not content:
+            return tool_error("content is required for 'replace' action", success=False)
+        result = store.replace(target, old_content, content)
+        if result.get("success"):
+            return tool_result(success=True, target=target,
+                               entries=store._entries_for(target))
+        return tool_error(result.get("error", "replace failed"), success=False)
+
+    if action == "remove":
+        if not old_content:
+            return tool_error("old_content is required for 'remove' action", success=False)
+        result = store.remove(target, old_content)
+        if result.get("success"):
+            return tool_result(success=True, target=target,
+                               entries=store._entries_for(target))
+        return tool_error(result.get("error", "remove failed"), success=False)
+
+    return tool_error(f"Unknown action: {action}. Use: add, replace, remove, read", success=False)
 
 
 class MemoryStore:
@@ -978,10 +1052,39 @@ class MemoryStore:
         self.user_entries = self._read_file(mem_dir / "USER.md")
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
         self.user_entries = list(dict.fromkeys(self.user_entries))
+        # Sanitize entries for the frozen snapshot — poisoned entries are
+        # replaced with [BLOCKED: ...] placeholders while the raw text
+        # stays in memory_entries so the user can inspect and remove it.
+        sanitized_memory = self._sanitize_entries_for_snapshot(self.memory_entries, "MEMORY.md")
+        sanitized_user = self._sanitize_entries_for_snapshot(self.user_entries, "USER.md")
         self._system_prompt_snapshot = {
-            "memory": self._render_block("memory", self.memory_entries),
-            "user": self._render_block("user", self.user_entries),
+            "memory": self._render_block("memory", sanitized_memory),
+            "user": self._render_block("user", sanitized_user),
         }
+
+    @staticmethod
+    def _sanitize_entries_for_snapshot(entries: list[str], filename: str) -> list[str]:
+        """Return entries with threat-matching entries replaced by placeholders."""
+        try:
+            from tools.threat_patterns import scan_for_threats
+        except ImportError:
+            return entries
+        sanitized: list[str] = []
+        for entry in entries:
+            if not entry or entry.startswith("[BLOCKED:"):
+                sanitized.append(entry)
+                continue
+            findings = scan_for_threats(entry, scope="strict")
+            if findings:
+                sanitized.append(
+                    f"[BLOCKED: {filename} entry contained threat pattern(s): "
+                    f"{', '.join(findings)}. Removed from system prompt; "
+                    f"use memory(action=read) to inspect and memory(action=remove) "
+                    f"to delete the original.]"
+                )
+            else:
+                sanitized.append(entry)
+        return sanitized
 
     @staticmethod
     def _path_for(target: str) -> Path:
@@ -1006,6 +1109,40 @@ class MemoryStore:
     def _char_limit(self, target: str) -> int:
         return self.user_char_limit if target == "user" else self.memory_char_limit
 
+    def _check_drift(self, target: str) -> Optional[dict[str, Any]]:
+        """Detect external modifications to the on-disk file.
+
+        Returns an error dict with ``drift_backup`` if drift is detected,
+        or ``None`` if the file is consistent with in-memory state.
+        """
+        path = self._path_for(target)
+        if not path.exists():
+            return None
+        try:
+            disk_content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+        expected = ENTRY_DELIMITER.join(self._entries_for(target))
+        if disk_content == expected:
+            return None
+        # Drift detected — create a backup and refuse to operate.
+        import time as _time
+        bak_path = path.with_suffix(f".bak.{int(_time.time())}")
+        try:
+            bak_path.write_text(disk_content, encoding="utf-8")
+        except OSError:
+            pass
+        return {
+            "success": False,
+            "error": (
+                f"External drift detected in {path.name}. "
+                f"File was modified outside this tool. "
+                f"See {bak_path.name} and issue #26045 for remediation."
+            ),
+            "drift_backup": str(bak_path),
+            "remediation": "Review the .bak file, reconcile changes, then retry.",
+        }
+
     def add(self, target: str, content: str) -> dict[str, Any]:
         content = content.strip()
         if not content:
@@ -1013,6 +1150,9 @@ class MemoryStore:
         scan_error = scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
+        drift = self._check_drift(target)
+        if drift:
+            return drift
         entries = self._entries_for(target)
         limit = self._char_limit(target)
         if content in entries:
@@ -1042,6 +1182,9 @@ class MemoryStore:
         scan_error = scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
+        drift = self._check_drift(target)
+        if drift:
+            return drift
         entries = self._entries_for(target)
         matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
         if not matches:
@@ -1067,6 +1210,9 @@ class MemoryStore:
         old_text = old_text.strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
+        drift = self._check_drift(target)
+        if drift:
+            return drift
         entries = self._entries_for(target)
         matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
         if not matches:
@@ -1143,7 +1289,7 @@ class MemoryStore:
                     f.write(content)
                     f.flush()
                     os.fsync(f.fileno())
-                atomic_replace(tmp_path, path)
+                os.replace(tmp_path, str(path))
             except BaseException:
                 try:
                     os.unlink(tmp_path)

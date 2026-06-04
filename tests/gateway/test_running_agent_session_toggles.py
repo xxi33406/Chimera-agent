@@ -56,6 +56,7 @@ def _make_runner():
     adapter.send = AsyncMock()
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._voice_mode = {}
+    runner._image_buffers = {}
     runner.hooks = SimpleNamespace(emit=AsyncMock(), loaded_hooks=False)
 
     session_entry = SessionEntry(

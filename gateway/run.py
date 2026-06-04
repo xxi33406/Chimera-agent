@@ -1829,6 +1829,7 @@ class GatewayRunner:
     _restart_task_started: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
+    _image_buffers: Dict[str, dict] = {}
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}

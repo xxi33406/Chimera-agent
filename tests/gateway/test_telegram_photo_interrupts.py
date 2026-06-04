@@ -21,6 +21,7 @@ def _make_runner():
     runner._pending_messages = {}
     runner._pending_approvals = {}
     runner._voice_mode = {}
+    runner._image_buffers = {}
     runner._is_user_authorized = lambda _source: True
     return runner
 

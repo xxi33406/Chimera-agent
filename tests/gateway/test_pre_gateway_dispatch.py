@@ -57,6 +57,7 @@ def _make_runner(platform: Platform):
     runner.session_store = MagicMock()
     runner._running_agents = {}
     runner._update_prompt_pending = {}
+    runner._image_buffers = {}
     return runner, adapter
 
 

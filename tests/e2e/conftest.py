@@ -211,6 +211,7 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._pending_model_notes = {}
     runner._update_prompt_pending = {}
     runner._voice_mode = {}
+    runner._image_buffers = {}
     runner._session_db = None
     runner._reasoning_config = None
     runner._provider_routing = {}

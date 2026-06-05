@@ -1014,9 +1014,10 @@ def discord_skill_commands_by_category(
 # ---------------------------------------------------------------------------
 
 # Slack slash command name constraints: lowercase a-z, 0-9, hyphens,
-# underscores. Max 32 chars. Slack app manifest accepts up to 50 slash
-# commands per app.
-_SLACK_MAX_SLASH_COMMANDS = 50
+# underscores. Max 32 chars. Slack app manifest accepts up to 100 slash
+# commands per app; we use 55 to accommodate all gateway-available
+# commands plus their short aliases (q, bg, btw, reset, fork, cost).
+_SLACK_MAX_SLASH_COMMANDS = 55
 _SLACK_NAME_LIMIT = 32
 _SLACK_INVALID_CHARS = re.compile(r"[^a-z0-9_\-]")
 _SLACK_RESERVED_COMMANDS = frozenset({

@@ -77,6 +77,8 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
     # even though they're joined into ``volatile``.
     memory_block = ""
     user_block = ""
+
+    # 1) Try the legacy MemoryStore shim (pre-Letta path).
     store = getattr(agent, "_memory_store", None)
     if store is not None:
         try:
@@ -84,6 +86,25 @@ def compute_prompt_breakdown(platform: str = "cli") -> Dict[str, Any]:
                 memory_block = store.format_for_system_prompt("memory") or ""
             if getattr(agent, "_user_profile_enabled", True):
                 user_block = store.format_for_system_prompt("user") or ""
+        except Exception:
+            pass
+
+    # 2) Fall back to Letta core-memory blocks (post-migration path).
+    #    The Letta system holds persona/human blocks that may have been
+    #    migrated from MEMORY.md/USER.md.  Measure them if the legacy
+    #    store produced empty results.
+    _letta = getattr(agent, "_letta_memory", None)
+    if _letta is not None:
+        try:
+            core = _letta.core
+            if not memory_block:
+                persona = core.get_block("persona")
+                if persona and persona.value:
+                    memory_block = persona.value
+            if not user_block:
+                human = core.get_block("human")
+                if human and human.value:
+                    user_block = human.value
         except Exception:
             pass
 

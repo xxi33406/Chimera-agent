@@ -60,6 +60,7 @@ def _make_runner():
     runner._exit_code = None
     runner._update_runtime_status = MagicMock()
     runner._is_user_authorized = lambda _source: True
+    runner._reply_gate_enabled = False
     runner.hooks = MagicMock()
     runner.hooks.emit = AsyncMock()
     runner.session_store = MagicMock()

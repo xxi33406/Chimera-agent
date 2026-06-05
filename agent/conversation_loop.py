@@ -611,22 +611,8 @@ def run_conversation(
             agent._turns_since_memory = 0
 
     # Add user message
-    from datetime import datetime as _datetime
     ts = time.time()
-    # 注入时间戳前缀（如果 agent 配置启用）
-    _ts_enabled = getattr(agent, '_message_timestamps', False)
-    if _ts_enabled:
-        dt = _datetime.fromtimestamp(ts)
-        _ts_fmt = getattr(agent, '_timestamp_format', 'short')
-        if _ts_fmt == 'short':
-            time_prefix = f"[{dt.strftime('%H:%M')}] "
-        elif _ts_fmt == 'long':
-            time_prefix = f"[{dt.strftime('%m-%d %H:%M')}] "
-        else:
-            time_prefix = ""
-        user_msg = {"role": "user", "content": time_prefix + user_message, "timestamp": ts}
-    else:
-        user_msg = {"role": "user", "content": user_message, "timestamp": ts}
+    user_msg = {"role": "user", "content": user_message, "timestamp": ts}
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx

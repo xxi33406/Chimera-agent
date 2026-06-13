@@ -81,6 +81,13 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # we resolve through ``_ra()`` to honor those patches.
     _r = _ra()
 
+    # Pre-compute dev session flag for gating tool enforcement and context loading
+    _is_dev_session = True  # default: assume dev session
+    if hasattr(agent, '_last_user_message') and agent._last_user_message:
+        from agent.prompt_builder import should_load_project_context
+        _is_dev_session = should_load_project_context(agent._last_user_message)
+    agent._is_dev_session = _is_dev_session
+
     # ── Stable tier ────────────────────────────────────────────────
     stable_parts: List[str] = []
 
@@ -162,19 +169,24 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             model_lower = (agent.model or "").lower()
             _inject = any(p in model_lower for p in TOOL_USE_ENFORCEMENT_MODELS)
         if _inject:
-            stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
-            _model_lower = (agent.model or "").lower()
-            # Google model operational guidance (conciseness, absolute
-            # paths, parallel tool calls, verify-before-edit, etc.)
-            if "gemini" in _model_lower or "gemma" in _model_lower:
-                stable_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
-            # OpenAI GPT/Codex execution discipline (tool persistence,
-            # prerequisite checks, verification, anti-hallucination).
-            # Also applied to xAI Grok — same failure modes (claims completion
-            # without tool calls, suggests workarounds instead of using
-            # existing tools, replies with plans instead of executing).
-            if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
-                stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
+            # Skip tool enforcement in casual chat sessions
+            _skip_for_chat = False
+            if hasattr(agent, '_is_dev_session') and not agent._is_dev_session:
+                _skip_for_chat = True
+            if not _skip_for_chat:
+                stable_parts.append(TOOL_USE_ENFORCEMENT_GUIDANCE)
+                _model_lower = (agent.model or "").lower()
+                # Google model operational guidance (conciseness, absolute
+                # paths, parallel tool calls, verify-before-edit, etc.)
+                if "gemini" in _model_lower or "gemma" in _model_lower:
+                    stable_parts.append(GOOGLE_MODEL_OPERATIONAL_GUIDANCE)
+                # OpenAI GPT/Codex execution discipline (tool persistence,
+                # prerequisite checks, verification, anti-hallucination).
+                # Also applied to xAI Grok — same failure modes (claims completion
+                # without tool calls, suggests workarounds instead of using
+                # existing tools, replies with plans instead of executing).
+                if "gpt" in _model_lower or "codex" in _model_lower or "grok" in _model_lower:
+                    stable_parts.append(OPENAI_MODEL_EXECUTION_GUIDANCE)
 
     has_skills_tools = any(name in agent.valid_tool_names for name in ['skills_list', 'skill_view', 'skill_manage'])
     if has_skills_tools:
@@ -229,8 +241,7 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             if _probe_line:
                 stable_parts.append(_probe_line)
         except Exception:
-            # Probe failure must never block prompt build.
-            pass
+            pass  # Never break prompt building for a probe
 
     # Active-profile hint — names the Hermes profile the agent is running
     # under so it doesn't conflate ~/.hermes/skills/ (default profile) with
@@ -310,6 +321,39 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
             user_block = agent._memory_store.format_for_system_prompt("user")
             if user_block:
                 volatile_parts.append(user_block)
+
+    # Letta three-tier memory — inject the frozen core-memory snapshot
+    # (persona / human blocks) captured at session start.  Live edits
+    # via core_memory_update tools persist to the DB but do NOT mutate
+    # the snapshot mid-session, preserving prompt-prefix caching.
+    _letta = getattr(agent, "_letta_memory", None)
+    if _letta is not None:
+        try:
+            _core_block = _letta.core.format_for_prompt()
+            if _core_block and _core_block.strip():
+                volatile_parts.append(_core_block)
+        except Exception:
+            pass
+
+        # Adaptive tone injection — read the live ``mood`` core block
+        # (e.g. "happy (conf=0.7)") and append a short, invisible tone
+        # hint derived from agent.emotion_detector.TONE_GUIDANCE.  This
+        # is read from the *live* DB rather than the frozen snapshot so
+        # the latest detected emotion takes effect on the next prompt
+        # rebuild without requiring a session restart.  Wrapped in a
+        # broad try/except — tone injection must never break prompt
+        # assembly.
+        try:
+            _mood_block = _letta.core.get_block("mood")
+            _mood_value = (_mood_block.value if _mood_block else "") or ""
+            if _mood_value.strip():
+                from agent.emotion_detector import TONE_GUIDANCE
+                _emotion_label = _mood_value.split("(")[0].strip().lower()
+                _guidance = TONE_GUIDANCE.get(_emotion_label, "")
+                if _guidance:
+                    volatile_parts.append(f"[语气调整: {_guidance}]")
+        except Exception:
+            pass  # Never crash prompt building for tone injection
 
     # External memory provider system prompt block (additive to built-in)
     if agent._memory_manager:

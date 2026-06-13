@@ -912,11 +912,9 @@ def _split_text_for_weixin_delivery(
     # content looks like a short chatty exchange, in which case split into
     # separate bubbles for a more natural chat feel.
     if len(content) <= max_length:
-        return (
-            [u for u in _split_delivery_units_for_weixin(content) if u]
-            if _should_split_short_chat_block_for_weixin(content)
-            else [content]
-        )
+        if _should_split_short_chat_block_for_weixin(content):
+            return [u for u in _split_delivery_units_for_weixin(content) if u]
+        return [content]
     return _pack_markdown_blocks_for_weixin(content, max_length) or [content]
 
 

@@ -252,6 +252,52 @@ class MemoryManager:
         self._providers: List[MemoryProvider] = []
         self._tool_to_provider: Dict[str, MemoryProvider] = {}
         self._has_external: bool = False  # True once a non-builtin provider is added
+        # Optional bridge to the Letta three-tier memory system.  When set
+        # (see :meth:`set_letta_memory`), :meth:`prefetch_all` will also
+        # surface relevant archival hits alongside the configured
+        # external providers.
+        self._letta_memory: Any = None
+
+    # -- Letta bridge --------------------------------------------------------
+
+    def set_letta_memory(self, letta_memory: Any) -> None:
+        """Register the Letta memory system for prefetch integration.
+
+        Duck-typed: any object exposing ``.archival.search`` and the
+        optional ``._config`` mapping will work.  Passing ``None`` clears
+        the bridge.
+        """
+        self._letta_memory = letta_memory
+
+    def _letta_prefetch(self, query: str) -> str:
+        """Pull a short archival-context block from the Letta system.
+
+        Best-effort: every failure path returns ``""`` so a misbehaving
+        backend can never block the main prefetch pipeline.
+        """
+        letta = getattr(self, "_letta_memory", None)
+        if not letta:
+            return ""
+        if not query or not query.strip():
+            return ""
+        parts: List[str] = []
+        try:
+            archival_config = getattr(letta, "_config", {}) or {}
+            if archival_config.get("archival_enabled", True):
+                try:
+                    top_k = int(archival_config.get("archival_search_top_k", 5))
+                except (TypeError, ValueError):
+                    top_k = 5
+                results = letta.archival.search(query, top_k=top_k)
+                if results:
+                    archival_text = "\n".join(
+                        f"- {getattr(r, 'content', '')}" for r in results[:3]
+                    )
+                    if archival_text.strip():
+                        parts.append(f"[Archival Memory]\n{archival_text}")
+        except Exception as exc:
+            logger.debug("Letta prefetch failed (non-fatal): %s", exc)
+        return "\n\n".join(parts)
 
     # -- Registration --------------------------------------------------------
 
@@ -343,6 +389,10 @@ class MemoryManager:
         are skipped. Failures in one provider don't block others.
         """
         parts = []
+        # Letta archival prefetch (cheap when no system is registered).
+        letta_ctx = self._letta_prefetch(query)
+        if letta_ctx:
+            parts.append(letta_ctx)
         for provider in self._providers:
             try:
                 result = provider.prefetch(query, session_id=session_id)

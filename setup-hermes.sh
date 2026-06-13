@@ -267,6 +267,42 @@ else
 fi
 
 # ============================================================================
+# Embedding model for memory system (optional)
+# ============================================================================
+
+if ! is_termux; then
+    echo ""
+    echo -e "${CYAN}→${NC} Memory system embedding setup..."
+    echo "  The memory system uses embeddings for semantic search."
+    echo "  Choose your embedding backend:"
+    echo ""
+    echo "    1) Local model (all-MiniLM-L6-v2, ~90MB download, no API cost)"
+    echo "    2) Remote API (OpenAI / custom endpoint, requires API key)"
+    echo "    3) Skip (configure later via config.yaml)"
+    echo ""
+    read -r -p "  Select [1/2/3] (default: 3): " EMBED_CHOICE
+    EMBED_CHOICE="${EMBED_CHOICE:-3}"
+
+    if [ "$EMBED_CHOICE" = "1" ]; then
+        echo -e "${CYAN}→${NC} Installing sentence-transformers and downloading model..."
+        if [ -n "$UV_CMD" ]; then
+            $UV_CMD pip install "sentence-transformers==4.1.0" "numpy==2.4.3" --python "$SETUP_PYTHON" 2>&1 | tail -5
+        else
+            "$SETUP_PYTHON" -m pip install "sentence-transformers==4.1.0" "numpy==2.4.3" 2>&1 | tail -5
+        fi
+        echo -e "${CYAN}→${NC} Downloading embedding model (one-time)..."
+        "$SETUP_PYTHON" -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-MiniLM-L6-v2')" 2>/dev/null
+        echo -e "${GREEN}✓${NC} Local embedding model ready"
+    elif [ "$EMBED_CHOICE" = "2" ]; then
+        echo -e "${GREEN}✓${NC} Remote embedding selected."
+        echo "    Configure EMBEDDING_API_KEY in ~/.hermes/.env"
+        echo "    and set memory.embedding.backend in config.yaml"
+    else
+        echo -e "${CYAN}→${NC} Skipped. Configure embedding later in config.yaml (memory.embedding section)"
+    fi
+fi
+
+# ============================================================================
 # ============================================================================
 # Optional: ripgrep (for faster file search)
 # ============================================================================

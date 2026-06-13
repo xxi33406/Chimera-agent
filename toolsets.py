@@ -47,7 +47,12 @@ _HERMES_CORE_TOOLS = [
     # Text-to-speech
     "text_to_speech",
     # Planning & memory
-    "todo", "memory",
+    "todo",
+    # Letta three-tier memory (core / recall / archival) + legacy compat shim.
+    "core_memory_get", "core_memory_update", "core_memory_replace",
+    "recall_memory_search",
+    "archival_memory_insert", "archival_memory_search", "archival_memory_delete",
+    "memory",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -211,8 +216,13 @@ TOOLSETS = {
     },
     
     "memory": {
-        "description": "Persistent memory across sessions (personal notes + user profile)",
-        "tools": ["memory"],
+        "description": "Letta-style three-tier memory: core blocks (persona/human), recall (FTS5 + semantic search of conversation history), and archival (hybrid FTS5 + vector long-term knowledge base). Legacy ``memory`` tool kept for backward compatibility.",
+        "tools": [
+            "core_memory_get", "core_memory_update", "core_memory_replace",
+            "recall_memory_search",
+            "archival_memory_insert", "archival_memory_search", "archival_memory_delete",
+            "memory",
+        ],
         "includes": []
     },
 
@@ -356,7 +366,11 @@ TOOLSETS = {
             "browser_type", "browser_scroll", "browser_back",
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
-            "todo", "memory",
+            "todo",
+            "core_memory_get", "core_memory_update", "core_memory_replace",
+            "recall_memory_search",
+            "archival_memory_insert", "archival_memory_search", "archival_memory_delete",
+            "memory",
             "session_search",
             "execute_code", "delegate_task",
         ],
@@ -382,7 +396,11 @@ TOOLSETS = {
             "browser_press", "browser_get_images",
             "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
             # Planning & memory
-            "todo", "memory",
+            "todo",
+            "core_memory_get", "core_memory_update", "core_memory_replace",
+            "recall_memory_search",
+            "archival_memory_insert", "archival_memory_search", "archival_memory_delete",
+            "memory",
             # Session history search
             "session_search",
             # Code execution + delegation

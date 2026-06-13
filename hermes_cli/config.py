@@ -768,6 +768,16 @@ DEFAULT_CONFIG = {
         # provider hiccups on a single provider.
         "api_max_retries": 3,
         "service_tier": "",
+        # Image wait buffer (CLI only): when the user submits image-only input
+        # (no accompanying text), the CLI buffers the images and waits for the
+        # next text input to merge them into a single turn. Set to 0 to disable
+        # buffering and process image-only submissions immediately.
+        "image_wait_seconds": 60,
+        # Smart reply gating: short/ambiguous messages are routed through an
+        # auxiliary LLM that decides whether the agent should reply at all.
+        # Long messages, questions and explicit task requests bypass the gate
+        # and always receive a reply.
+        "reply_gate_enabled": True,
         # Tool-use enforcement: injects system prompt guidance that tells the
         # model to actually call tools instead of describing intended actions.
         # Values: "auto" (default — applies to gpt/codex models), true/false
@@ -842,8 +852,23 @@ DEFAULT_CONFIG = {
         # only controls how inbound user images are presented.
         "image_input_mode": "auto",
         "disabled_toolsets": [],
+        # 用户消息时间戳注入：为每条用户消息添加时间前缀，
+        # 使 LLM 具备时间感知能力。同时会将 timestamp 作为独立字段
+        # 存储到会话数据库，供压缩器作时间感知决策。
+        "message_timestamps": True,
+        # 时间戳格式："short" = [HH:MM]，"long" = [MM-DD HH:MM]，"off" = 禁用。
+        "timestamp_format": "short",
     },
-    
+
+    "billing": {
+        "enabled": True,
+        "daily_limit_usd": 5.0,
+        "monthly_limit_usd": 50.0,
+        "warning_threshold": 0.8,
+        "hard_stop": False,
+        "track_auxiliary": True,
+    },
+
     "terminal": {
         "backend": "local",
         "modal_mode": "auto",
@@ -1263,6 +1288,21 @@ DEFAULT_CONFIG = {
             "timeout": 600,
             "extra_body": {},
         },
+        # Dream Engine — background memory consolidation LLM calls.
+        # Runs in a daemon thread after N turns, performing distill/archive/
+        # merge/decay operations. A cheap, fast model is recommended here
+        # (e.g. gemini-flash, haiku) since dream calls are non-interactive
+        # and low-stakes. "auto" = use main model.
+        "dream": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "max_tokens": 500,
+            "temperature": 0.3,
+            "timeout": 60,
+            "extra_body": {},
+        },
     },
     
     "display": {
@@ -1543,17 +1583,81 @@ DEFAULT_CONFIG = {
         "engine": "compressor",
     },
 
-    # Persistent memory -- bounded curated memory injected into system prompt
+    # Persistent memory -- MemGPT-style three-tier memory architecture.
+    # See agent/memory_manager.py for the runtime implementation.
     "memory": {
-        "memory_enabled": True,
-        "user_profile_enabled": True,
-        "memory_char_limit": 2200,   # ~800 tokens at 2.75 chars/token
-        "user_char_limit": 1375,     # ~500 tokens at 2.75 chars/token
-        # External memory provider plugin (empty = built-in only).
+        # ── Core Memory: in-context blocks injected into the system prompt.
+        # Bounded character budgets keep the prompt cache stable.
+        "core_memory_enabled": True,
+        "blocks": {
+            "persona": {
+                "description": "Agent's personal notes, observations, and learned facts",
+                "char_limit": 2200,   # ~800 tokens at 2.75 chars/token
+            },
+            "human": {
+                "description": "What the agent knows about the user",
+                "char_limit": 1375,   # ~500 tokens at 2.75 chars/token
+            },
+            "patterns": {
+                "description": "Learned behavioral patterns and rules",
+                "char_limit": 1500,
+            },
+            "mood": {
+                "description": "Current detected user emotion",
+                "char_limit": 100,
+            },
+            "interests": {
+                "description": "Aggregated user interests from conversations",
+                "char_limit": 800,
+            },
+        },
+        # ── Recall Memory: searchable conversation history (FTS5).
+        "recall_enabled": True,
+        "recall_search_limit": 20,
+        # ── Archival Memory: vector-indexed long-term knowledge base.
+        "archival_enabled": True,
+        "archival_search_top_k": 5,
+        # ── Embedding configuration for archival semantic search.
+        # backend: sentence_transformers | openai | openai_compatible | ollama
+        "embedding": {
+            "backend": "sentence_transformers",
+            "model": "all-MiniLM-L6-v2",
+            "dimensions": 384,
+            "cache_model": True,
+            "api_key": "",
+            "base_url": "",
+            # LRU cache for repeated-text embeddings (avoids recomputation).
+            "cache_enabled": True,
+            "cache_max_entries": 5000,
+        },
+        # External memory provider plugin (legacy, still supported).
         # Set to a provider name to activate: "openviking", "mem0",
         # "hindsight", "holographic", "retaindb", "byterover".
         # Only ONE external provider is allowed at a time.
         "provider": "",
+
+        # ── Dream Engine: background memory consolidation that runs in a
+        # daemon thread after every ``trigger_turns`` user turns.  Light
+        # dreams distill key facts into core memory and archive useful
+        # knowledge; deep dreams (every ``deep_trigger_turns``) additionally
+        # merge near-duplicate archival entries and prune outdated core
+        # lines.  All operations are best-effort and never block the
+        # main conversation loop.
+        "dream_engine": {
+            "enabled": True,
+            "trigger_turns": 5,
+            "deep_trigger_turns": 20,
+            "use_llm": True,
+            "max_archival_merge": 10,
+            "distill_to_core": True,
+            "log_dreams": True,
+            "idle_consolidation": True,
+            "idle_threshold_minutes": 30,
+            "idle_sample_size": 10,
+            "idle_merge_threshold": 0.85,
+            "pattern_learning_interval": 5,
+            "pattern_min_frequency": 3,
+        },
     },
 
     # Subagent delegation — override the provider:model used by delegate_task
@@ -1864,6 +1968,15 @@ DEFAULT_CONFIG = {
         # for restricted networks, audited environments, or air-gapped
         # systems where any runtime install is unacceptable.
         "allow_lazy_installs": True,
+        "data_shield": {
+            "enabled": True,
+            "policy": "auto",           # auto | strict | off
+            "shield_auxiliary": True,   # 脱敏辅助 LLM 调用
+            "shield_embedding": False,  # 脱敏远程 embedding（默认关闭，影响语义）
+            "custom_keywords": [],      # 用户自定义脱敏词列表
+            "preserve_code_structure": True,  # 保留代码结构但替换变量名
+            "log_shielded": False,      # 调试用：记录脱敏日志
+        },
     },
 
     "cron": {
@@ -1990,6 +2103,23 @@ DEFAULT_CONFIG = {
         "level": "INFO",       # Minimum level for agent.log: DEBUG, INFO, WARNING
         "max_size_mb": 5,      # Max size per log file before rotation
         "backup_count": 3,     # Number of rotated backup files to keep
+        # Periodic process memory usage logging (gateway only). Emits a
+        # grep-friendly "[MEMORY] rss=...MB ..." line at the configured
+        # interval so slow leaks in the long-lived gateway are visible
+        # in agent.log / gateway.log as a time series. Ported from
+        # cline/cline#10343.
+        "memory_monitor": {
+            "enabled": True,         # Flip to false to silence the periodic line
+            "interval_seconds": 300, # Default: every 5 minutes
+            # Threshold-based alerting and emergency cleanup. When RSS
+            # crosses warning_threshold_mb a WARNING line is logged (and
+            # gc.collect() runs if auto_gc_on_warning is true). Crossing
+            # critical_threshold_mb logs an ERROR and triggers emergency
+            # cleanup (full GC + embedding-cache flush).
+            "warning_threshold_mb": 1400,
+            "critical_threshold_mb": 1700,
+            "auto_gc_on_warning": True,
+        },
     },
 
     # Remotely-hosted model catalog manifest.  When enabled, the CLI fetches
@@ -2316,6 +2446,14 @@ REQUIRED_ENV_VARS = {}
 
 # Optional environment variables that enhance functionality
 OPTIONAL_ENV_VARS = {
+    # ── Memory embedding (remote backends only) ──
+    "EMBEDDING_API_KEY": {
+        "description": "API key for remote embedding service (OpenAI, Azure, custom endpoint)",
+        "prompt": "Embedding API Key",
+        "url": "https://platform.openai.com/api-keys",
+        "password": True,
+        "category": "tool",
+    },
     # ── Provider (handled in provider selection, not shown in checklists) ──
     "NOUS_BASE_URL": {
         "description": "Nous Portal base URL override",

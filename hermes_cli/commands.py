@@ -133,6 +133,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
 
     CommandDef("personality", "Set a predefined personality", "Configuration",
                args_hint="[name]"),
+    CommandDef("memory", "Browse and manage persistent memory (Letta)",
+               "Configuration", cli_only=True,
+               aliases=("mem",),
+               args_hint="<list|search|stats|forget|export|import> [args]",
+               subcommands=("list", "search", "stats", "forget", "export", "import")),
     CommandDef("statusbar", "Toggle the context/model status bar", "Configuration",
                cli_only=True, aliases=("sb",)),
     CommandDef("verbose", "Cycle tool progress display: off -> new -> all -> verbose",
@@ -217,6 +222,11 @@ COMMAND_REGISTRY: list[CommandDef] = [
                cli_only=True, args_hint="<path>"),
     CommandDef("update", "Update Hermes Agent to the latest version", "Info"),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
+    CommandDef("billing", "Show cost tracking, budget status, and TokenJuice gauge",
+               "Info",
+               aliases=("wallet", "cost", "juice"),
+               args_hint="[status|history|reset]",
+               subcommands=("status", "history", "reset")),
 
     # Exit
     CommandDef("quit", "Exit the CLI (use --delete to also remove session history)", "Exit",
@@ -1004,9 +1014,10 @@ def discord_skill_commands_by_category(
 # ---------------------------------------------------------------------------
 
 # Slack slash command name constraints: lowercase a-z, 0-9, hyphens,
-# underscores. Max 32 chars. Slack app manifest accepts up to 50 slash
-# commands per app.
-_SLACK_MAX_SLASH_COMMANDS = 50
+# underscores. Max 32 chars. Slack app manifest accepts up to 100 slash
+# commands per app; we use 55 to accommodate all gateway-available
+# commands plus their short aliases (q, bg, btw, reset, fork, cost).
+_SLACK_MAX_SLASH_COMMANDS = 55
 _SLACK_NAME_LIMIT = 32
 _SLACK_INVALID_CHARS = re.compile(r"[^a-z0-9_\-]")
 _SLACK_RESERVED_COMMANDS = frozenset({
@@ -1077,14 +1088,19 @@ def slack_native_slashes() -> list[tuple[str, str, str]]:
             continue
         _add(cmd.name, cmd.description, cmd.args_hint or "")
 
-    # Second pass: aliases.
+    # Second pass: aliases, sorted by length so short aliases (like /q)
+    # get priority when the 50-command Slack cap truncates the list.
+    _pending_aliases: list[tuple[str, str, str]] = []
     for cmd in COMMAND_REGISTRY:
         if not _is_gateway_available(cmd, overrides):
             continue
         for alias in cmd.aliases:
-            # Skip aliases that only differ from canonical by case/punctuation
-            # normalization (already covered by _add dedup).
-            _add(alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+            _pending_aliases.append(
+                (alias, f"Alias for /{cmd.name} — {cmd.description}", cmd.args_hint or "")
+            )
+    _pending_aliases.sort(key=lambda t: len(t[0]))
+    for alias_name, alias_desc, alias_hint in _pending_aliases:
+        _add(alias_name, alias_desc, alias_hint)
 
     # Third pass: plugin commands.
     for name, description, args_hint in _iter_plugin_command_entries():

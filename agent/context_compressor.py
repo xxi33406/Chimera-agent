@@ -34,6 +34,46 @@ from agent.redact import redact_sensitive_text
 
 logger = logging.getLogger(__name__)
 
+# ── 时间感知压缩辅助 ──
+# 用户消息可能携带 [HH:MM] 或 [MM-DD HH:MM] 前缀（由
+# conversation_loop 注入）。这里提供一个获取消息“年龄”的工具、
+# 以及一个供压缩中间区间按“越旧越优先压缩”排序的 sort key。
+# 它们只作为现有 token-budget 逻辑的补充，不会改变主决策路径。
+_TIMESTAMP_PATTERN = re.compile(r'^\[(\d{2}-\d{2}\s)?\d{2}:\d{2}\]\s')
+
+
+def _extract_message_age_hours(msg: dict) -> float:
+    """返回消息年龄（小时）。未知则返回 -1。
+
+    优先读取独立的 ``timestamp`` 字段；后退到按 content 前缀检测
+    （后者仅能识别“含时间戳”但无法还原绝对时间，仅作弱信号）。
+    """
+    if not isinstance(msg, dict):
+        return -1.0
+    ts = msg.get("timestamp")
+    if ts:
+        try:
+            return (time.time() - float(ts)) / 3600.0
+        except (TypeError, ValueError):
+            pass
+    content = msg.get("content", "")
+    if isinstance(content, str) and _TIMESTAMP_PATTERN.match(content):
+        # 存在时间前缀但无明确数值时间戳 — 作为“当前会话”处理。
+        return 0.0
+    return -1.0
+
+
+def _age_sort_key(msg: dict) -> float:
+    """压缩优先级排序键：越旧的消息返回越小的值（优先被压缩）。
+
+    年龄未知时返回 0，避免在未提供时间戳的会话里产生偏移。
+    """
+    age = _extract_message_age_hours(msg)
+    if age < 0:
+        return 0.0
+    return -age
+
+
 SUMMARY_PREFIX = (
     "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted "
     "into the summary below. This is a handoff from a previous context "
@@ -1336,7 +1376,12 @@ Be specific with file paths, commands, line numbers, and results.]
 ## Critical Context
 [Any specific values, error messages, configuration details, or data that would be lost without explicit preservation. NEVER include API keys, tokens, passwords, or credentials — write [REDACTED] instead.]
 
-Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, and specific values. Avoid vague descriptions like "made some changes" — say exactly what changed.
+## Relationship Context
+- Preserve any emotional exchanges, mood changes, or personal sharing from the user
+- Keep relationship-relevant details: user's feelings, things they cared about, promises or plans mentioned
+- Retain the emotional tone of the conversation (was it warm? playful? serious?)
+
+Target ~{summary_budget} tokens. Be CONCRETE — include file paths, command outputs, error messages, line numbers, specific values, user emotional expressions and personal sharing, and relationship details: promises, plans, things the user cared about. Avoid vague descriptions like "made some changes" — say exactly what changed.
 
 Write only the summary body. Do not include any preamble or prefix."""
 
@@ -1909,6 +1954,24 @@ The user has requested that this compaction PRIORITISE preserving all informatio
             if summary_body and not self._previous_summary:
                 self._previous_summary = summary_body
             turns_to_summarize = messages[max(compress_start, summary_idx + 1):compress_end]
+
+        # --- Time-aware compression priority ---
+        # Sort middle-section messages by age: oldest first (compressed with higher priority)
+        # Preserve user+assistant+tool interaction groups to maintain coherence
+        if turns_to_summarize and len(turns_to_summarize) > 4:
+            _groups = []
+            _gi = 0
+            while _gi < len(turns_to_summarize):
+                _group_start = _gi
+                _gi += 1
+                # Collect the full interaction group: user msg + following assistant/tool msgs
+                while _gi < len(turns_to_summarize) and turns_to_summarize[_gi].get("role") in ("assistant", "tool"):
+                    _gi += 1
+                _groups.append(turns_to_summarize[_group_start:_gi])
+
+            # Sort groups by the age of the first message (oldest first)
+            _groups.sort(key=lambda grp: _age_sort_key(grp[0]))
+            turns_to_summarize = [msg for grp in _groups for msg in grp]
 
         if not self.quiet_mode:
             logger.info(

@@ -119,6 +119,14 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Memory providers ──────────────────────────────────────────────────
     "memory.honcho": ("honcho-ai==2.0.1",),
     "memory.hindsight": ("hindsight-client==0.6.1",),
+    # Local embedding model for memory semantic search (archival memory).
+    # Maps to the [embedding-local] extra in pyproject.toml. Pulls
+    # sentence-transformers + a numpy pin compatible with the rest of
+    # the stack (faster-whisper also uses 2.4.3).
+    "memory.embedding.sentence_transformers": (
+        "sentence-transformers==4.1.0",
+        "numpy==2.4.3",
+    ),
 
     # ─── Messaging platforms (lazy-installable on demand) ──────────────────
     "platform.telegram": ("python-telegram-bot[webhooks]==22.6",),

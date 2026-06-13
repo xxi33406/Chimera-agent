@@ -1,0 +1,36 @@
+enabled: true
+target_platform: telegram
+target_chat_id: "YOUR_CHAT_ID_HERE"
+target_user_id: "YOUR_USER_ID_HERE"
+timezone: UTC
+heartbeat_schedule: every 25m
+active_window_start: '8:00'
+active_window_end: '22:00'
+min_user_idle_minutes: 10
+min_proactive_gap_minutes: 30
+daily_send_limit: 20
+recent_message_limit: 8
+restore_message_limit: 3
+cron_job_name: active-message
+prompt_file: ~/.hermes/active-message/cron_prompt.txt
+cron_script: active-message-build-context.py
+jobs_file: ~/.hermes/cron/jobs.json
+output_root: ~/.hermes/cron/output
+state_file: ~/.hermes/active-message/state.json
+db_path: ~/.hermes/state.db
+topics:
+- type: quote
+  weight: 20
+  description: An inspiring quote or saying
+- type: news
+  weight: 25
+  description: Interesting news or fun facts
+- type: quiz
+  weight: 15
+  description: A small riddle or interactive question
+- type: care
+  weight: 25
+  description: A caring check-in message
+- type: music
+  weight: 15
+  description: A song recommendation or music topic

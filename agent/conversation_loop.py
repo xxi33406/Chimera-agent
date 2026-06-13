@@ -64,6 +64,55 @@ from utils import base_url_host_matches, env_var_enabled
 logger = logging.getLogger(__name__)
 
 
+class BudgetExceededError(Exception):
+    """Raised when spending exceeds configured budget limits."""
+    pass
+
+
+def _check_billing_budget(agent: Any, charge_amount: float) -> None:
+    """Check budget limits after each API call and warn/stop if exceeded."""
+    if charge_amount <= 0:
+        return
+    db = getattr(agent, '_session_db', None)
+    if not db or not hasattr(db, 'charge_wallet'):
+        return
+
+    wallet = db.charge_wallet(charge_amount, source="main_model")
+    billing_cfg = getattr(agent, '_billing_config', {})
+
+    daily_limit = billing_cfg.get("daily_limit_usd", 0)
+    monthly_limit = billing_cfg.get("monthly_limit_usd", 0)
+    threshold = billing_cfg.get("warning_threshold", 0.8)
+    hard_stop = billing_cfg.get("hard_stop", False)
+
+    # Check daily limit
+    if daily_limit > 0:
+        ratio = wallet["spent_today_usd"] / daily_limit
+        if ratio >= 1.0 and hard_stop:
+            raise BudgetExceededError(
+                f"Daily budget ${daily_limit:.2f} exceeded (spent ${wallet['spent_today_usd']:.4f})"
+            )
+        elif ratio >= threshold and not wallet.get("warning_sent_today"):
+            logger.warning(
+                "[BILLING] Daily spend $%.4f reached %.0f%% of $%.2f limit",
+                wallet["spent_today_usd"], ratio * 100, daily_limit
+            )
+            db._mark_warning_sent()
+
+    # Check monthly limit
+    if monthly_limit > 0:
+        ratio = wallet["spent_month_usd"] / monthly_limit
+        if ratio >= 1.0 and hard_stop:
+            raise BudgetExceededError(
+                f"Monthly budget ${monthly_limit:.2f} exceeded (spent ${wallet['spent_month_usd']:.4f})"
+            )
+        elif ratio >= threshold:
+            logger.warning(
+                "[BILLING] Monthly spend $%.4f reached %.0f%% of $%.2f limit",
+                wallet["spent_month_usd"], ratio * 100, monthly_limit
+            )
+
+
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
     if not getattr(agent, "tools", None):
@@ -286,6 +335,9 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
     # First turn of a new session (or recovering from a broken stored
     # prompt) — build from scratch.
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
+
+    # Topic-driven memory recall is now handled per-turn (not at session
+    # start) — see the ephemeral injection block before the first API call.
 
     # Plugin hook: on_session_start — fired once when a brand-new
     # session is created (not on continuation).  Plugins can use this
@@ -559,7 +611,8 @@ def run_conversation(
             agent._turns_since_memory = 0
 
     # Add user message
-    user_msg = {"role": "user", "content": user_message}
+    ts = time.time()
+    user_msg = {"role": "user", "content": user_message, "timestamp": ts}
     messages.append(user_msg)
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
@@ -583,6 +636,28 @@ def run_conversation(
         _restore_or_build_system_prompt(agent, system_message, conversation_history)
 
     active_system_prompt = agent._cached_system_prompt
+
+    # ── Topic-driven memory recall (replaces session-start recall) ──
+    # When the user's message mentions entities that exist in archival
+    # memory, inject a one-shot hint via ephemeral_system_prompt so the
+    # agent can reference shared past context naturally.  10-min cooldown
+    # prevents over-triggering.
+    try:
+        _letta = getattr(agent, "_letta_memory", None)
+        if _letta is not None and getattr(_letta, "_db", None) is not None:
+            from agent.memory_recall import check_topic_recall
+            _recall_hint = check_topic_recall(
+                user_message,
+                _letta,
+                _letta._db,
+            )
+            if _recall_hint:
+                if agent.ephemeral_system_prompt:
+                    agent.ephemeral_system_prompt += _recall_hint
+                else:
+                    agent.ephemeral_system_prompt = _recall_hint
+    except Exception:
+        pass
 
     # ── Preflight context compression ──
     # Before entering the main loop, check if the loaded conversation
@@ -1900,6 +1975,10 @@ def run_conversation(
                         agent.session_estimated_cost_usd += float(cost_result.amount_usd)
                     agent.session_cost_status = cost_result.status
                     agent.session_cost_source = cost_result.source
+
+                    # --- Budget enforcement ---
+                    if getattr(agent, '_billing_enabled', False):
+                        _check_billing_budget(agent, float(cost_result.amount_usd or 0))
 
                     # Persist token counts to session DB for /insights.
                     # Do this for every platform with a session_id so non-CLI
@@ -4720,6 +4799,19 @@ def run_conversation(
             )
         except Exception:
             pass  # Background review is best-effort
+
+    # Dream Engine — non-blocking memory consolidation hook.
+    # Runs entirely on a daemon thread; any error here must never
+    # interrupt the response that's about to be returned to the user.
+    _dream_engine = getattr(agent, "_dream_engine", None)
+    if _dream_engine is not None and final_response and not interrupted:
+        try:
+            _dream_engine.on_turn_complete(
+                getattr(agent, "session_id", None) or "",
+                messages[-10:],
+            )
+        except Exception as _de_err:
+            logger.debug("Dream Engine trigger error: %s", _de_err)
 
     # Note: Memory provider on_session_end() + shutdown_all() are NOT
     # called here — run_conversation() is called once per user message in

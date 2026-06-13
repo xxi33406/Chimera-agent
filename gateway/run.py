@@ -1829,6 +1829,7 @@ class GatewayRunner:
     _restart_task_started: bool = False
     _restart_detached: bool = False
     _restart_via_service: bool = False
+    _image_buffers: Dict[str, dict] = {}
     _restart_command_source: Optional[SessionSource] = None
     _stop_task: Optional[asyncio.Task] = None
     _session_model_overrides: Dict[str, Dict[str, str]] = {}
@@ -2060,9 +2061,79 @@ class GatewayRunner:
         # capture / STT pipeline, which otherwise produces a second delayed reply.
         self._recent_voice_transcripts: Dict[tuple[int, int], List[tuple[float, str]]] = {}
 
+        # Image wait buffer: when a pure-image message arrives, hold it
+        # briefly (default 60s) waiting for a follow-up text message to merge.
+        # Key: session_key -> {"event": MessageEvent, "timer": TimerHandle, "adapter": ...}
+        self._image_buffers: Dict[str, dict] = {}
+
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
+
+    # ────────────────────────────────────────────────────────────────
+    # Image wait buffer helpers
+    # ────────────────────────────────────────────────────────────────
+
+    def _is_image_only(self, event) -> bool:
+        """Check if event is image-only (has media but no meaningful text)."""
+        has_media = bool(getattr(event, 'media_urls', None))
+        text = (getattr(event, 'text', '') or '').strip()
+        return has_media and not text
+
+    async def _buffer_image_event(self, session_key: str, event, adapter) -> None:
+        """Buffer image event and start timeout timer."""
+        # Cancel existing timer if any (multiple images = merge)
+        if session_key in self._image_buffers:
+            existing = self._image_buffers[session_key]
+            existing["timer"].cancel()
+            # Merge media_urls from new event into existing
+            existing_event = existing["event"]
+            existing_event.media_urls.extend(getattr(event, 'media_urls', []))
+            if hasattr(event, 'media_types'):
+                existing_event.media_types.extend(getattr(event, 'media_types', []))
+        else:
+            self._image_buffers[session_key] = {
+                "event": event,
+                "adapter": adapter,
+            }
+
+        # Start/restart timer
+        wait_seconds = getattr(self, '_image_wait_seconds', 60)
+        loop = asyncio.get_event_loop()
+        timer = loop.call_later(
+            wait_seconds,
+            lambda sk=session_key: asyncio.ensure_future(
+                self._flush_image_buffer(sk)
+            )
+        )
+        self._image_buffers[session_key]["timer"] = timer
+
+    async def _flush_image_buffer(self, session_key: str) -> None:
+        """Timeout expired — process buffered image alone."""
+        buf = self._image_buffers.pop(session_key, None)
+        if not buf:
+            return
+        try:
+            event = buf["event"]
+            # Mark so _handle_message won't re-buffer this event
+            event._from_image_flush = True  # type: ignore[attr-defined]
+            await self._handle_message(event)
+        except Exception as exc:
+            logger.warning("Image buffer flush failed for %s: %s", session_key, exc)
+
+    def _merge_buffered_image(self, session_key: str, text_event):
+        """Merge buffered image into incoming text event."""
+        buf = self._image_buffers.pop(session_key, None)
+        if buf:
+            buf["timer"].cancel()
+            buffered_event = buf["event"]
+            # Prepend buffered media to text event
+            text_event.media_urls = getattr(buffered_event, 'media_urls', []) + getattr(text_event, 'media_urls', [])
+            if hasattr(buffered_event, 'media_types') and hasattr(text_event, 'media_types'):
+                text_event.media_types = getattr(buffered_event, 'media_types', []) + getattr(text_event, 'media_types', [])
+        return text_event
+
+    # ────────────────────────────────────────────────────────────────
 
     def _wire_teams_pipeline_runtime(self) -> None:
         """Bind the Teams meeting pipeline runtime to Graph webhook ingress.
@@ -7400,6 +7471,35 @@ class GatewayRunner:
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+
+        # --- Image wait buffer ---
+        # If configured, buffer pure-image messages and wait for a follow-up
+        # text message to merge them.  Timeout flushes the image alone.
+        if not is_internal:
+            _image_wait = getattr(self, '_image_wait_seconds', None)
+            if _image_wait is None:
+                try:
+                    from hermes_cli.config import load_config as _load_img_cfg
+                    _img_cfg = (_load_img_cfg() or {}).get("agent", {})
+                    self._image_wait_seconds = int(_img_cfg.get("image_wait_seconds", 60))
+                except Exception:
+                    self._image_wait_seconds = 60
+                _image_wait = self._image_wait_seconds
+
+            if _image_wait > 0:
+                # Pure image: buffer it (unless it was already flushed by timeout)
+                if self._is_image_only(event) and not getattr(event, '_from_image_flush', False):
+                    adapter = self.adapters.get(source.platform)
+                    await self._buffer_image_event(_quick_key, event, adapter)
+                    return None
+
+                # Text arriving while an image is buffered: merge them
+                if _quick_key in self._image_buffers:
+                    # Don't merge with slash commands
+                    is_command = bool(event.text and event.text.strip().startswith("/"))
+                    if not is_command:
+                        event = self._merge_buffered_image(_quick_key, event)
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -8392,6 +8492,66 @@ class GatewayRunner:
             if self._should_send_telegram_lobby_reminder(source):
                 return self._telegram_topic_root_lobby_message()
             return None
+
+        # --- Smart reply gate ---
+        # Short / ambiguous messages are routed through an auxiliary LLM
+        # which decides whether the agent should respond or stay silent.
+        # Long messages, questions and explicit task requests bypass the
+        # gate entirely (see agent.reply_gate.needs_llm_check).
+        try:
+            _gate_enabled = getattr(self, '_reply_gate_enabled', None)
+            if _gate_enabled is None:
+                try:
+                    from hermes_cli.config import load_config as _load_gate_cfg
+                    _gate_cfg_data = (_load_gate_cfg() or {}).get("agent", {})
+                    self._reply_gate_enabled = bool(_gate_cfg_data.get("reply_gate_enabled", True))
+                except Exception:
+                    self._reply_gate_enabled = True
+                _gate_enabled = self._reply_gate_enabled
+
+            if _gate_enabled and not is_internal:
+                from agent.reply_gate import (
+                    needs_llm_check,
+                    build_gate_prompt,
+                    parse_gate_response,
+                )
+
+                _gate_msg_text = getattr(event, 'text', '') or ''
+                if _gate_msg_text and needs_llm_check(_gate_msg_text):
+                    # Best-effort fetch of recent conversation history for context.
+                    _gate_recent: List[Dict[str, Any]] = []
+                    try:
+                        _gate_entry = self.session_store.get_or_create_session(source)
+                        _gate_history = self.session_store.load_transcript(
+                            _gate_entry.session_id
+                        ) or []
+                        _gate_recent = _gate_history[-6:]
+                    except Exception:
+                        _gate_recent = []
+
+                    _gate_prompt = build_gate_prompt(_gate_msg_text, _gate_recent)
+
+                    from agent.auxiliary_client import call_llm as _gate_call_llm
+                    _gate_resp = await asyncio.to_thread(
+                        _gate_call_llm,
+                        task="reply_gate",
+                        messages=[{"role": "user", "content": _gate_prompt}],
+                        max_tokens=5,
+                        temperature=0.0,
+                    )
+                    _gate_resp_text = (
+                        _gate_resp.choices[0].message.content
+                        if hasattr(_gate_resp, 'choices')
+                        else str(_gate_resp)
+                    )
+                    if not parse_gate_response(_gate_resp_text):
+                        logger.info(
+                            "reply_gate: silent for session=%s text=%r",
+                            _quick_key, _gate_msg_text[:80],
+                        )
+                        return None
+        except Exception as _gate_exc:
+            logger.debug("reply_gate skipped due to error: %s", _gate_exc)
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -19400,6 +19560,43 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # Idempotent, so repeated calls from AIAgent.__init__ won't duplicate.
     from hermes_logging import setup_logging
     setup_logging(hermes_home=_hermes_home, mode="gateway")
+
+    # Periodic process memory usage logging (gateway only) — emits a
+    # grep-friendly "[MEMORY] rss=...MB ..." line every N minutes so
+    # slow leaks in the long-lived gateway process show up as a time
+    # series in agent.log / gateway.log.  Ported from cline/cline#10343.
+    # Controlled by the logging.memory_monitor section in config.yaml.
+    try:
+        from gateway import memory_monitor as _memory_monitor
+
+        _mm_cfg = {}
+        try:
+            # config is loaded a few lines up; re-read the logging section
+            # here so we pick up user overrides without coupling to local
+            # variable names inside the start_gateway body.
+            from hermes_cli.config import load_config as _load_cli_config
+
+            _mm_cfg = (_load_cli_config() or {}).get("logging", {}).get("memory_monitor", {}) or {}
+        except Exception:
+            _mm_cfg = {}
+        if _mm_cfg.get("enabled", True):
+            try:
+                _mm_interval = float(_mm_cfg.get("interval_seconds", 300))
+            except (TypeError, ValueError):
+                _mm_interval = 300.0
+            try:
+                _memory_monitor.configure_thresholds(
+                    {
+                        "warning_threshold_mb": _mm_cfg.get("warning_threshold_mb", 1400),
+                        "critical_threshold_mb": _mm_cfg.get("critical_threshold_mb", 1700),
+                        "auto_gc_on_warning": _mm_cfg.get("auto_gc_on_warning", True),
+                    }
+                )
+            except Exception:
+                pass
+            _memory_monitor.start_memory_monitoring(interval_seconds=_mm_interval)
+    except Exception as _mm_exc:
+        logger.debug("Failed to start memory monitor: %s", _mm_exc)
 
     # Optional stderr handler — level driven by -v/-q flags on the CLI.
     # verbosity=None (-q/--quiet): no stderr output

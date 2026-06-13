@@ -107,12 +107,99 @@ from utils import base_url_host_matches, base_url_hostname, normalize_proxy_env_
 logger = logging.getLogger(__name__)
 
 
+# ── Auxiliary cost attribution (TokenJuice) ───────────────────────────────
+
+_wallet_db_instance = None
+_wallet_db_lock = threading.Lock()
+
+
+def _get_wallet_db():
+    """Lazily obtain a cached SessionDB for wallet charges (best-effort)."""
+    global _wallet_db_instance
+    if _wallet_db_instance is not None:
+        return _wallet_db_instance
+    with _wallet_db_lock:
+        if _wallet_db_instance is not None:
+            return _wallet_db_instance
+        try:
+            from hermes_state import SessionDB
+            _wallet_db_instance = SessionDB()
+            return _wallet_db_instance
+        except Exception:
+            return None
+
+
+def _track_auxiliary_cost(model: str, input_tokens: int, output_tokens: int,
+                          provider: str = None, base_url: str = None,
+                          task: str = "auxiliary") -> None:
+    """Track auxiliary model cost in the wallet (best-effort, never raises)."""
+    try:
+        from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
+        usage = CanonicalUsage(input_tokens=input_tokens, output_tokens=output_tokens)
+        result = estimate_usage_cost(model, usage, provider=provider, base_url=base_url)
+        if result.amount_usd and float(result.amount_usd) > 0:
+            db = _get_wallet_db()
+            if db and hasattr(db, 'charge_wallet'):
+                db.charge_wallet(float(result.amount_usd), source=f"auxiliary_{task}")
+    except Exception:
+        pass  # Never crash auxiliary flow for billing
+
+
+def _maybe_track_response_cost(response: Any, task: str = None,
+                                model: str = None, provider: str = None,
+                                base_url: str = None) -> None:
+    """Best-effort cost tracking from a completed LLM response."""
+    try:
+        usage = getattr(response, 'usage', None)
+        if usage and getattr(usage, 'prompt_tokens', 0) > 0:
+            _track_auxiliary_cost(
+                model=model or getattr(response, 'model', '') or '',
+                input_tokens=getattr(usage, 'prompt_tokens', 0),
+                output_tokens=getattr(usage, 'completion_tokens', 0),
+                provider=provider,
+                base_url=base_url,
+                task=task or "auxiliary",
+            )
+    except Exception:
+        pass
+
+
 def _safe_isinstance(obj: Any, maybe_type: Any) -> bool:
     """Return False instead of raising when a patched symbol is not a type."""
     try:
         return isinstance(obj, maybe_type)
     except TypeError:
         return False
+
+
+# ── Data Shield integration ──────────────────────────────────────────────
+
+def _init_shield_from_config():
+    """Initialize DataShield from hermes config (called once on first use)."""
+    try:
+        from agent.data_shield import init_data_shield, get_data_shield
+        if get_data_shield() is not None:
+            return  # Already initialized
+        # Try to read config — may not be available in all contexts (gateway etc.)
+        from hermes_cli.config import load_config
+        config = load_config()
+        shield_config = config.get("security", {}).get("data_shield", {})
+        init_data_shield(shield_config)
+    except Exception:
+        pass
+
+
+def _get_data_shield():
+    """Get the DataShield singleton (lazy import + init on first use)."""
+    try:
+        from agent.data_shield import get_data_shield
+        shield = get_data_shield()
+        if shield is None:
+            _init_shield_from_config()
+            shield = get_data_shield()
+        return shield
+    except Exception:
+        return None
 
 
 def _extract_url_query_params(url: str):
@@ -5047,11 +5134,33 @@ def call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    # Data Shield: redact sensitive content before sending to external API
+    _shield_ctx = None
+    _ds = _get_data_shield()
+    if _ds and _ds.enabled and _ds.shield_auxiliary:
+        try:
+            kwargs["messages"], _shield_ctx = _ds.shield_messages(kwargs["messages"])
+        except Exception as _shield_err:
+            logger.debug("DataShield: shield failed, sending unredacted: %s", _shield_err)
+            _shield_ctx = None
+
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     try:
-        return _validate_llm_response(
-            client.chat.completions.create(**kwargs), task)
+        _resp = client.chat.completions.create(**kwargs)
+        # Data Shield: restore placeholders in response
+        if _shield_ctx and _shield_ctx.has_replacements:
+            try:
+                if hasattr(_resp, 'choices'):
+                    for _choice in _resp.choices:
+                        if hasattr(_choice, 'message') and _choice.message and hasattr(_choice.message, 'content'):
+                            if _choice.message.content:
+                                _choice.message.content = _ds.unshield_text(_choice.message.content, _shield_ctx)
+            except Exception as _unshield_err:
+                logger.debug("DataShield: unshield failed: %s", _unshield_err)
+        _maybe_track_response_cost(_resp, task=task, model=final_model,
+                                    provider=resolved_provider, base_url=resolved_base_url)
+        return _validate_llm_response(_resp, task)
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
@@ -5516,9 +5625,31 @@ async def async_call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    # Data Shield: redact sensitive content before sending to external API
+    _shield_ctx = None
+    _ds = _get_data_shield()
+    if _ds and _ds.enabled and _ds.shield_auxiliary:
+        try:
+            kwargs["messages"], _shield_ctx = _ds.shield_messages(kwargs["messages"])
+        except Exception as _shield_err:
+            logger.debug("DataShield (async): shield failed, sending unredacted: %s", _shield_err)
+            _shield_ctx = None
+
     try:
-        return _validate_llm_response(
-            await client.chat.completions.create(**kwargs), task)
+        _resp = await client.chat.completions.create(**kwargs)
+        # Data Shield: restore placeholders in response
+        if _shield_ctx and _shield_ctx.has_replacements:
+            try:
+                if hasattr(_resp, 'choices'):
+                    for _choice in _resp.choices:
+                        if hasattr(_choice, 'message') and _choice.message and hasattr(_choice.message, 'content'):
+                            if _choice.message.content:
+                                _choice.message.content = _ds.unshield_text(_choice.message.content, _shield_ctx)
+            except Exception as _unshield_err:
+                logger.debug("DataShield (async): unshield failed: %s", _unshield_err)
+        _maybe_track_response_cost(_resp, task=task, model=final_model,
+                                    provider=resolved_provider, base_url=resolved_base_url)
+        return _validate_llm_response(_resp, task)
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)

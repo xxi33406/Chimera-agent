@@ -1518,6 +1518,7 @@ class AIAgent:
                     ]
                 elif isinstance(msg.get("tool_calls"), list):
                     tool_calls_data = msg["tool_calls"]
+                msg_timestamp = msg.get("timestamp")  # 可能为 None（旧消息或未启用时间戳注入）
                 self._session_db.append_message(
                     session_id=self.session_id,
                     role=role,
@@ -1531,6 +1532,7 @@ class AIAgent:
                     reasoning_details=msg.get("reasoning_details") if role == "assistant" else None,
                     codex_reasoning_items=msg.get("codex_reasoning_items") if role == "assistant" else None,
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
+                    timestamp=msg_timestamp,
                 )
             self._last_flushed_db_idx = len(messages)
         except Exception as e:
@@ -2475,6 +2477,19 @@ class AIAgent:
                 self._memory_manager.shutdown_all()
             except Exception:
                 pass
+        # Close the Letta three-tier memory system's DB connections.
+        _letta = getattr(self, "_letta_memory", None)
+        if _letta is not None:
+            try:
+                _letta.shutdown()
+            except Exception:
+                pass
+            try:
+                from tools.memory_tool import set_memory_system as _clear_mem
+                _clear_mem(None)
+            except Exception:
+                pass
+            self._letta_memory = None
         # Notify context engine of session end (flush DAG, close DBs, etc.)
         if hasattr(self, "context_compressor") and self.context_compressor:
             try:
@@ -2546,6 +2561,46 @@ class AIAgent:
         """
         if interrupted:
             return
+        # Mirror the completed turn into the Letta recall memory tier so
+        # later recall_memory_search() calls can find it.  Best-effort:
+        # every failure path is swallowed because the legacy/external
+        # provider branch below must still get a chance to run.
+        _letta = getattr(self, "_letta_memory", None)
+        if _letta is not None and original_user_message:
+            try:
+                _user_text = (
+                    original_user_message
+                    if isinstance(original_user_message, str)
+                    else str(original_user_message)
+                )
+                if _user_text:
+                    _letta.recall.add_message(
+                        session_id=self.session_id or "",
+                        role="user",
+                        content=_user_text,
+                    )
+                    # Lightweight emotion detection — wraps its own try/except
+                    # internally so this never breaks the message flow.
+                    try:
+                        _letta._update_mood(_user_text)
+                    except Exception:
+                        pass
+                if final_response:
+                    _assistant_text = (
+                        final_response
+                        if isinstance(final_response, str)
+                        else str(final_response)
+                    )
+                    if _assistant_text:
+                        _letta.recall.add_message(
+                            session_id=self.session_id or "",
+                            role="assistant",
+                            content=_assistant_text,
+                        )
+            except Exception as _recall_exc:
+                logger.debug(
+                    "Recall memory sync failed (non-fatal): %s", _recall_exc
+                )
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:
@@ -4582,6 +4637,7 @@ class AIAgent:
         persist_user_message: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
+        self._last_user_message = user_message
         from agent.conversation_loop import run_conversation
         return run_conversation(self, user_message, system_message, conversation_history, task_id, stream_callback, persist_user_message)
 

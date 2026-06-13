@@ -36,7 +36,7 @@ import os
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +47,90 @@ _stop_event: Optional[threading.Event] = None
 _start_time: Optional[float] = None
 _interval_seconds: float = 300.0  # 5 minutes
 _lock = threading.Lock()
+
+# Threshold configuration (set via configure_thresholds()).  Empty by default,
+# which keeps thresholds disabled (backward compatible).
+_threshold_config: Dict[str, Any] = {}
+
+
+def configure_thresholds(config: Optional[Dict[str, Any]]) -> None:
+    """Set memory threshold configuration.
+
+    Expected keys (all optional):
+        warning_threshold_mb: int   (default 1400)
+        critical_threshold_mb: int  (default 1700)
+        auto_gc_on_warning: bool    (default True)
+
+    Pass None or empty dict to disable threshold checks.
+    """
+    global _threshold_config
+    _threshold_config = dict(config or {})
+
+
+def _emergency_cleanup() -> None:
+    """Emergency memory cleanup when critical threshold exceeded."""
+    # 1. Force full GC across all generations.
+    try:
+        gc.collect(2)
+    except Exception:
+        pass
+
+    # 2. Clear embedding cache if available.
+    try:
+        from agent.embedding_engine import get_embedding_cache
+
+        cache = get_embedding_cache()
+        if cache is not None and hasattr(cache, "clear"):
+            try:
+                cache.clear()
+                logger.info("[MEMORY] Cleared embedding cache")
+            except Exception as exc:
+                logger.debug("Embedding cache clear failed: %s", exc)
+    except Exception:
+        pass
+
+    # 3. Log post-cleanup snapshot.
+    try:
+        rss_after = _get_rss_mb()
+        threads_after = threading.active_count()
+        logger.info(
+            "[MEMORY] After cleanup: rss=%sMB threads=%d",
+            rss_after if rss_after is not None else "unavailable",
+            threads_after,
+        )
+    except Exception:
+        pass
+
+
+def _check_thresholds(rss_mb: float) -> None:
+    """Check RSS against warning/critical thresholds and take action."""
+    if not _threshold_config:
+        return
+
+    try:
+        warning = float(_threshold_config.get("warning_threshold_mb", 1400))
+        critical = float(_threshold_config.get("critical_threshold_mb", 1700))
+    except (TypeError, ValueError):
+        return
+
+    if rss_mb >= critical:
+        logger.error(
+            "[MEMORY] CRITICAL: rss=%.0fMB exceeds %.0fMB \u2014 running emergency cleanup",
+            rss_mb,
+            critical,
+        )
+        _emergency_cleanup()
+    elif rss_mb >= warning:
+        logger.warning(
+            "[MEMORY] WARNING: rss=%.0fMB exceeds %.0fMB",
+            rss_mb,
+            warning,
+        )
+        if _threshold_config.get("auto_gc_on_warning", True):
+            try:
+                gc.collect()
+            except Exception:
+                pass
 
 
 def _get_rss_mb() -> Optional[int]:
@@ -131,6 +215,9 @@ def _monitor_loop(stop_event: threading.Event, interval: float) -> None:
     while not stop_event.wait(interval):
         try:
             log_memory_usage()
+            rss = _get_rss_mb()
+            if rss is not None:
+                _check_thresholds(float(rss))
         except Exception as e:
             # Never let the monitor crash the gateway; just log and carry on.
             logger.debug("Memory monitor iteration failed: %s", e)

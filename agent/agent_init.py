@@ -74,6 +74,47 @@ def _normalized_custom_base_url(value: Any) -> str:
     return value.strip().rstrip("/")
 
 
+def _build_dream_auxiliary_fn(agent: Any):
+    """Return a callable bridging the Dream Engine to ``call_llm()``.
+
+    The returned function accepts ``(prompt, task="dream")`` and returns
+    the raw text response (or ``None`` on any failure).  It deliberately
+    swallows every exception — dream-time LLM errors must never escape
+    into the conversation loop.
+    """
+
+    def _dream_llm_call(prompt: str, task: str = "dream") -> Optional[str]:
+        try:
+            from agent.auxiliary_client import call_llm
+
+            response = call_llm(
+                task="dream",
+                main_runtime={
+                    "model": getattr(agent, "model", None) or None,
+                    "provider": getattr(agent, "provider", None),
+                    "base_url": getattr(agent, "base_url", None),
+                    "api_key": getattr(agent, "api_key", None),
+                    "api_mode": getattr(agent, "api_mode", None),
+                },
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,
+                max_tokens=500,
+                timeout=60.0,
+            )
+            try:
+                content = response.choices[0].message.content
+            except (AttributeError, IndexError, TypeError):
+                return None
+            if not isinstance(content, str):
+                return str(content) if content else None
+            return content
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("Dream auxiliary LLM call failed: %s", exc)
+            return None
+
+    return _dream_llm_call
+
+
 def _custom_provider_model_matches(agent_model: str, entry: Dict[str, Any]) -> bool:
     provider_model = str(entry.get("model", "") or "").strip().lower()
     if not provider_model:
@@ -1067,14 +1108,15 @@ def init_agent(
     agent._memory_nudge_interval = 10
     agent._turns_since_memory = 0
     agent._iters_since_skill = 0
+    mem_config: Dict[str, Any] = {}
     if not skip_memory:
         try:
-            mem_config = _agent_cfg.get("memory", {})
+            mem_config = _agent_cfg.get("memory", {}) or {}
             agent._memory_enabled = mem_config.get("memory_enabled", False)
             agent._user_profile_enabled = mem_config.get("user_profile_enabled", False)
             agent._memory_nudge_interval = int(mem_config.get("nudge_interval", 10))
             if agent._memory_enabled or agent._user_profile_enabled:
-                from tools.memory_tool import MemoryStore
+                from tools.memory_tool import MemoryStore  # type: ignore[attr-defined]
                 agent._memory_store = MemoryStore(
                     memory_char_limit=mem_config.get("memory_char_limit", 2200),
                     user_char_limit=mem_config.get("user_char_limit", 1375),
@@ -1082,8 +1124,78 @@ def init_agent(
                 agent._memory_store.load_from_disk()
         except Exception:
             pass  # Memory is optional -- don't break agent init
-    
 
+    # -- Letta three-tier memory system (core / recall / archival) --
+    # Replaces the legacy MEMORY.md / USER.md file store with a single
+    # SQLite-backed system.  External provider plugins (Honcho, etc.)
+    # continue to be handled by the MemoryManager block further below;
+    # the two paths coexist.
+    agent._letta_memory = None
+    if not skip_memory and mem_config.get("core_memory_enabled", True):
+        try:
+            from agent.letta_memory import LettaMemorySystem
+            from tools.memory_tool import set_memory_system
+            from agent.memory_migration import needs_migration, migrate_to_letta
+
+            _letta_memory = LettaMemorySystem(config=mem_config)
+            _letta_memory.initialize()
+
+            # First-run migration from legacy MEMORY.md / USER.md files.
+            if needs_migration():
+                try:
+                    _migration_stats = migrate_to_letta(_letta_memory)
+                    if _migration_stats.get("migrated"):
+                        _ra().logger.info(
+                            "Legacy memory migrated to Letta system"
+                        )
+                        # Re-snapshot so the freshly migrated blocks land
+                        # in the system prompt.
+                        _letta_memory.core.load_snapshot()
+                except Exception as _mig_exc:
+                    _ra().logger.warning(
+                        "Memory migration failed (non-fatal): %s", _mig_exc
+                    )
+
+            # Wire into the tool registry so core_/recall_/archival_*
+            # handlers can resolve the active system.
+            set_memory_system(_letta_memory)
+            agent._letta_memory = _letta_memory
+        except Exception as _letta_exc:
+            _ra().logger.warning(
+                "Failed to initialize Letta memory system: %s", _letta_exc
+            )
+            agent._letta_memory = None
+
+    # -- Dream Engine (background memory consolidation) --
+    # Spawns a daemon thread every N turns to distill facts into core
+    # memory, archive useful knowledge, merge near-duplicates, and prune
+    # outdated core lines.  All work happens off the main conversation
+    # path — failures are logged at DEBUG and never interrupt the user.
+    agent._dream_engine = None
+    _dream_cfg = mem_config.get("dream_engine", {}) if isinstance(mem_config, dict) else {}
+    if (
+        not skip_memory
+        and isinstance(_dream_cfg, dict)
+        and _dream_cfg.get("enabled", False)
+        and getattr(agent, "_letta_memory", None) is not None
+    ):
+        try:
+            from agent.dream_engine import DreamEngine
+
+            _dream_aux_fn = None
+            if _dream_cfg.get("use_llm", True):
+                _dream_aux_fn = _build_dream_auxiliary_fn(agent)
+
+            agent._dream_engine = DreamEngine(
+                memory_system=agent._letta_memory,
+                config=_dream_cfg,
+                auxiliary_fn=_dream_aux_fn,
+            )
+        except Exception as _dream_exc:
+            _ra().logger.warning(
+                "Failed to initialize Dream Engine: %s", _dream_exc
+            )
+            agent._dream_engine = None
 
     # Memory provider plugin (external — one at a time, alongside built-in)
     # Reads memory.provider from config to select which plugin to activate.
@@ -1150,6 +1262,14 @@ def init_agent(
             _ra().logger.warning("Memory provider plugin init failed: %s", _mpe)
             agent._memory_manager = None
 
+    # Bridge the Letta system into the MemoryManager so its prefetch
+    # pipeline can also surface archival hits alongside external providers.
+    if agent._memory_manager is not None and agent._letta_memory is not None:
+        try:
+            agent._memory_manager.set_letta_memory(agent._letta_memory)
+        except Exception:
+            pass
+
     # Inject memory provider tool schemas into the tool surface.
     # Skip tools whose names already exist (plugins may register the
     # same tools via ctx.register_tool(), which lands in agent.tools
@@ -1197,6 +1317,19 @@ def init_agent(
     if not isinstance(_agent_section, dict):
         _agent_section = {}
     agent._tool_use_enforcement = _agent_section.get("tool_use_enforcement", "auto")
+
+    # 用户消息时间戳注入配置（供 conversation_loop 读取）。
+    # 启用后会为每条用户消息加上时间前缀（使 LLM 具备时间感知），
+    # 并将 timestamp 作为独立字段写入会话 DB。
+    agent._message_timestamps = bool(_agent_section.get("message_timestamps", True))
+    agent._timestamp_format = _agent_section.get("timestamp_format", "short")
+
+    # Billing configuration (budget enforcement in conversation_loop)
+    _billing_cfg = _agent_cfg.get("billing", {}) if _agent_cfg else {}
+    if not isinstance(_billing_cfg, dict):
+        _billing_cfg = {}
+    agent._billing_enabled = bool(_billing_cfg.get("enabled", True))
+    agent._billing_config = _billing_cfg
 
     # Universal task-completion guidance toggle.  Default True.  Surfaced
     # as a separate flag from tool_use_enforcement because the guidance

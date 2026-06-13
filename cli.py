@@ -3008,6 +3008,29 @@ def save_config_value(key_path: str, value: any) -> bool:
 # HermesCLI Class
 # ============================================================================
 
+def _make_gauge_bar(ratio: float, width: int = 20) -> str:
+    """Create a text gauge bar like ████████░░░░ with color based on fill ratio."""
+    ratio = max(0.0, min(ratio, 1.0))
+    filled = int(ratio * width)
+    empty = width - filled
+    if ratio >= 0.9:
+        color = "red"
+    elif ratio >= 0.7:
+        color = "yellow"
+    else:
+        color = "green"
+    return f"[{color}]{'█' * filled}[/{color}][dim]{'░' * empty}[/dim]"
+
+
+def _format_tokens(count: int) -> str:
+    """Format token count as human readable (e.g. 125K, 1.2M)."""
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.0f}K"
+    return str(count)
+
+
 class HermesCLI:
     """
     Interactive CLI for the Hermes Agent.
@@ -3376,6 +3399,11 @@ class HermesCLI:
         self._command_status = ""
         self._attached_images: list[Path] = []
         self._image_counter = 0
+        # Image wait buffer: holds (placeholder_text, [Path, ...]) when the
+        # user submits an image-only turn so the next text input can be
+        # merged with the buffered images. Reset back to None on consumption.
+        # Controlled by config key agent.image_wait_seconds (0 = disabled).
+        self._pending_image: "tuple[str, list[Path]] | None" = None
         self.preloaded_skills: list[str] = []
         self._startup_skills_line_shown = False
 
@@ -5564,6 +5592,24 @@ class HermesCLI:
             self._attached_images.append(img_path)
             return True
         self._image_counter -= 1
+        return False
+
+    def _is_image_only_input(self, user_input: str, submit_images: list) -> bool:
+        """Return True when this turn carries images but no real user text.
+
+        The CLI normalises image submissions into ``(text, [Path, ...])``
+        tuples, so the canonical pure-image case is ``submit_images`` populated
+        with empty/whitespace text. We also recognise the auto-generated
+        placeholder produced by drag-and-drop (``[User attached image: ...]``)
+        as "no real text" so dragging an image without typing also buffers.
+        """
+        if not submit_images:
+            return False
+        text = (user_input or "").strip()
+        if not text:
+            return True
+        if text.startswith("[User attached image:") and text.endswith("]"):
+            return True
         return False
 
     def _handle_rollback_command(self, command: str):
@@ -8245,6 +8291,453 @@ class HermesCLI:
             print("  Usage: /personality <name>")
             print()
     
+    def _get_memory_system(self):
+        """Locate the active Letta memory system, if any."""
+        memory = getattr(self, "_memory_system", None)
+        if memory is None:
+            agent = getattr(self, "agent", None)
+            memory = getattr(agent, "_letta_memory", None) if agent is not None else None
+        return memory
+
+    def _handle_memory_command(self, cmd_text: str):
+        """Handle the /memory slash command and its subcommands."""
+        from rich.console import Console
+
+        console = Console()
+        parts = cmd_text.strip().split(None, 2)  # ["/memory", subcmd, args]
+        subcmd = parts[1].lower() if len(parts) > 1 else "list"
+        args = parts[2] if len(parts) > 2 else ""
+
+        memory = self._get_memory_system()
+        if memory is None:
+            console.print(
+                "[yellow]Memory system not initialized. Start a conversation first.[/yellow]"
+            )
+            return
+
+        if subcmd == "list":
+            self._memory_list(memory, console)
+        elif subcmd == "search":
+            if not args:
+                console.print("[yellow]Usage: /memory search <query>[/yellow]")
+                return
+            self._memory_search(memory, args, console)
+        elif subcmd == "stats":
+            self._memory_stats(memory, console)
+        elif subcmd == "forget":
+            if not args:
+                console.print("[yellow]Usage: /memory forget <id>[/yellow]")
+                return
+            self._memory_forget(memory, args, console)
+        elif subcmd == "export":
+            self._memory_export(memory, args, console)
+        elif subcmd == "import":
+            if not args:
+                console.print("[yellow]Usage: /memory import <filepath>[/yellow]")
+                return
+            self._memory_import(memory, args, console)
+        else:
+            console.print(f"[yellow]Unknown subcommand: {subcmd}[/yellow]")
+            console.print("Available: list, search, stats, forget, export, import")
+
+    def _memory_list(self, memory, console):
+        """Show core memory blocks plus archival/recall counts."""
+        import time
+        from rich.table import Table
+
+        table = Table(title="Core Memory Blocks", show_lines=True)
+        table.add_column("Block", style="cyan", width=15)
+        table.add_column("Content", style="white", max_width=60)
+        table.add_column("Updated", style="dim", width=20)
+
+        blocks = []
+        core = getattr(memory, "core", None)
+        if core is not None and hasattr(core, "list_blocks"):
+            try:
+                blocks = core.list_blocks() or []
+            except Exception as exc:
+                console.print(f"[dim]Failed to list core blocks: {exc}[/dim]")
+
+        if blocks:
+            for block in blocks:
+                label = getattr(block, "label", None) or (
+                    block.get("label", "?") if isinstance(block, dict) else "?"
+                )
+                value = getattr(block, "value", None)
+                if value is None and isinstance(block, dict):
+                    value = block.get("value", "") or block.get("content", "")
+                value = (value or "")[:100]
+                updated = getattr(block, "updated_at", None)
+                if updated is None and isinstance(block, dict):
+                    updated = block.get("updated_at")
+                if isinstance(updated, (int, float)) and updated > 0:
+                    updated = time.strftime("%Y-%m-%d %H:%M", time.localtime(updated))
+                else:
+                    updated = "\u2014"
+                table.add_row(str(label), str(value), str(updated))
+        else:
+            table.add_row("(empty)", "No blocks stored", "\u2014")
+
+        console.print(table)
+
+        archival_count = 0
+        recall_count = 0
+        archival = getattr(memory, "archival", None)
+        if archival is not None and hasattr(archival, "_db"):
+            try:
+                conn = archival._db.connect()
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM archival_entries"
+                ).fetchone()
+                archival_count = row[0] if row else 0
+            except Exception:
+                pass
+        recall = getattr(memory, "recall", None)
+        if recall is not None and hasattr(recall, "_db"):
+            try:
+                conn = recall._db.connect()
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM recall_messages"
+                ).fetchone()
+                recall_count = row[0] if row else 0
+            except Exception:
+                pass
+
+        console.print(
+            f"\n  Archival entries: [cyan]{archival_count}[/cyan]  |  "
+            f"Recall messages: [cyan]{recall_count}[/cyan]"
+        )
+
+    def _memory_search(self, memory, query, console):
+        """Search archival + recall memory and show merged results."""
+        from rich.table import Table
+
+        results = []
+
+        archival = getattr(memory, "archival", None)
+        if archival is not None and hasattr(archival, "search"):
+            try:
+                archival_results = archival.search(query, top_k=5) or []
+                for r in archival_results:
+                    content = getattr(r, "content", None)
+                    if content is None and isinstance(r, dict):
+                        content = r.get("content", "")
+                    score = getattr(r, "relevance_score", None)
+                    if score is None and isinstance(r, dict):
+                        score = r.get("score", r.get("relevance_score", 0.0))
+                    entry_id = getattr(r, "id", None)
+                    if entry_id is None and isinstance(r, dict):
+                        entry_id = r.get("id", "?")
+                    try:
+                        score_str = f"{float(score or 0.0):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "0.000"
+                    results.append(
+                        ("archival", entry_id, (content or "")[:80], score_str)
+                    )
+            except Exception as exc:
+                console.print(f"[dim]Archival search error: {exc}[/dim]")
+
+        recall = getattr(memory, "recall", None)
+        if recall is not None and hasattr(recall, "search"):
+            try:
+                recall_results = recall.search(query, limit=5) or []
+                for r in recall_results:
+                    content = getattr(r, "content", None)
+                    if content is None:
+                        content = r.get("content", "") if isinstance(r, dict) else str(r)
+                    score = getattr(r, "relevance_score", None)
+                    if score is None and isinstance(r, dict):
+                        score = r.get("score", r.get("relevance_score", 0.0))
+                    entry_id = getattr(r, "id", None)
+                    if entry_id is None and isinstance(r, dict):
+                        entry_id = r.get("id", "?")
+                    try:
+                        score_str = f"{float(score or 0.0):.3f}"
+                    except (TypeError, ValueError):
+                        score_str = "0.000"
+                    results.append(
+                        ("recall", entry_id, (content or "")[:80], score_str)
+                    )
+            except Exception as exc:
+                console.print(f"[dim]Recall search error: {exc}[/dim]")
+
+        if not results:
+            console.print("[dim]No results found.[/dim]")
+            return
+
+        table = Table(title=f"Search: '{query}'")
+        table.add_column("Type", style="magenta", width=10)
+        table.add_column("ID", style="dim", width=8)
+        table.add_column("Content", style="white")
+        table.add_column("Score", style="cyan", width=8)
+
+        for type_, id_, content, score in results:
+            table.add_row(type_, str(id_), content, score)
+
+        console.print(table)
+
+    def _memory_stats(self, memory, console):
+        """Show aggregated memory statistics."""
+        import time
+        from rich.panel import Panel
+
+        lines = []
+
+        archival = getattr(memory, "archival", None)
+        archival_db = getattr(archival, "_db", None) if archival is not None else None
+        if archival_db is not None:
+            try:
+                conn = archival_db.connect()
+                archival_count = conn.execute(
+                    "SELECT COUNT(*) FROM archival_entries"
+                ).fetchone()[0]
+                lines.append(f"Archival entries: {archival_count}")
+
+                try:
+                    scored = conn.execute(
+                        "SELECT COUNT(*), AVG(importance) FROM archival_scoring"
+                    ).fetchone()
+                    if scored and scored[0]:
+                        avg_imp = scored[1] if scored[1] is not None else 0.0
+                        lines.append(
+                            f"Scored entries: {scored[0]} (avg importance: {avg_imp:.2f})"
+                        )
+                except Exception:
+                    pass
+
+                try:
+                    dream_tc = conn.execute(
+                        "SELECT value FROM dream_state WHERE key='turn_count'"
+                    ).fetchone()
+                    dream_tt = conn.execute(
+                        "SELECT value FROM dream_state WHERE key='total_turns'"
+                    ).fetchone()
+                    dream_last = conn.execute(
+                        "SELECT value FROM dream_state WHERE key='last_dream_time'"
+                    ).fetchone()
+                    if dream_tc:
+                        total = dream_tt[0] if dream_tt else "?"
+                        lines.append(
+                            f"Dream: turns since last={dream_tc[0]}, total={total}"
+                        )
+                    if dream_last:
+                        last_t = float(dream_last[0])
+                        ago = int(time.time() - last_t)
+                        lines.append(
+                            f"Last dream: {ago}s ago ({time.strftime('%H:%M', time.localtime(last_t))})"
+                        )
+                except Exception:
+                    pass
+            except Exception as exc:
+                lines.append(f"DB error: {exc}")
+
+        recall = getattr(memory, "recall", None)
+        recall_db = getattr(recall, "_db", None) if recall is not None else None
+        if recall_db is not None:
+            try:
+                conn = recall_db.connect()
+                recall_count = conn.execute(
+                    "SELECT COUNT(*) FROM recall_messages"
+                ).fetchone()[0]
+                lines.append(f"Recall messages: {recall_count}")
+            except Exception:
+                pass
+
+        try:
+            from agent.embedding_engine import get_embedding_cache
+            cache = get_embedding_cache()
+            if cache is not None and hasattr(cache, "stats"):
+                stats = cache.stats()
+                size = stats.get("size", "?")
+                max_entries = stats.get("max_entries", "?")
+                hit_rate = stats.get("hit_rate", 0.0)
+                try:
+                    hit_rate_str = f"{float(hit_rate):.1%}"
+                except (TypeError, ValueError):
+                    hit_rate_str = str(hit_rate)
+                lines.append(
+                    f"Embedding cache: {size}/{max_entries} (hit rate: {hit_rate_str})"
+                )
+        except Exception:
+            pass
+
+        try:
+            from agent.data_shield import get_data_shield
+            shield = get_data_shield()
+            if shield is not None and hasattr(shield, "get_stats"):
+                ss = shield.get_stats()
+                redactions = ss.get("total_redactions", 0)
+                calls = ss.get("total_calls", 0)
+                lines.append(
+                    f"Data Shield: {redactions} redactions in {calls} calls"
+                )
+                cats = ss.get("by_category") or {}
+                if cats:
+                    cats_str = ", ".join(f"{k}:{v}" for k, v in cats.items())
+                    lines.append(f"  Categories: {cats_str}")
+        except Exception:
+            pass
+
+        try:
+            from gateway.memory_monitor import _get_rss_mb
+            rss = _get_rss_mb()
+            if rss and rss > 0:
+                lines.append(f"Process RSS: {rss:.0f} MB")
+        except Exception:
+            pass
+
+        panel_text = "\n".join(lines) if lines else "No memory statistics available."
+        console.print(Panel(panel_text, title="Memory Stats", border_style="cyan"))
+
+    def _memory_forget(self, memory, id_str, console):
+        """Delete an archival entry by ID."""
+        try:
+            entry_id = int(id_str.strip())
+        except (TypeError, ValueError):
+            console.print("[red]Invalid ID. Must be an integer.[/red]")
+            return
+
+        archival = getattr(memory, "archival", None)
+        if archival is None or not hasattr(archival, "delete"):
+            console.print("[yellow]Archival memory not available.[/yellow]")
+            return
+
+        try:
+            ok = archival.delete(entry_id)
+        except Exception as exc:
+            console.print(f"[red]Failed to delete: {exc}[/red]")
+            return
+
+        if ok:
+            console.print(f"[green]Deleted archival entry #{entry_id}[/green]")
+        else:
+            console.print(
+                f"[yellow]Archival entry #{entry_id} not found.[/yellow]"
+            )
+
+    def _memory_export(self, memory, filepath, console):
+        """Export core blocks and archival entries to a JSON file."""
+        import json as _json
+        import time
+
+        filepath = (filepath or "").strip() or f"memory_export_{int(time.time())}.json"
+
+        export_data = {
+            "exported_at": time.time(),
+            "core": [],
+            "archival": [],
+            "recall": [],
+        }
+
+        core = getattr(memory, "core", None)
+        if core is not None and hasattr(core, "list_blocks"):
+            try:
+                blocks = core.list_blocks() or []
+                serialised = []
+                for block in blocks:
+                    if hasattr(block, "__dict__"):
+                        serialised.append({
+                            "label": getattr(block, "label", ""),
+                            "description": getattr(block, "description", ""),
+                            "value": getattr(block, "value", ""),
+                            "char_limit": getattr(block, "char_limit", 0),
+                            "updated_at": getattr(block, "updated_at", 0.0),
+                        })
+                    elif isinstance(block, dict):
+                        serialised.append(block)
+                export_data["core"] = serialised
+            except Exception as exc:
+                console.print(f"[dim]Failed to export core blocks: {exc}[/dim]")
+
+        archival = getattr(memory, "archival", None)
+        archival_db = getattr(archival, "_db", None) if archival is not None else None
+        if archival_db is not None:
+            try:
+                conn = archival_db.connect()
+                rows = conn.execute(
+                    "SELECT id, content, metadata_json, created_at FROM archival_entries"
+                ).fetchall()
+                export_data["archival"] = [
+                    {
+                        "id": r[0],
+                        "content": r[1],
+                        "metadata": r[2],
+                        "created_at": r[3],
+                    }
+                    for r in rows
+                ]
+            except Exception as exc:
+                console.print(f"[dim]Failed to export archival entries: {exc}[/dim]")
+
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                _json.dump(export_data, f, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            console.print(f"[red]Export failed: {exc}[/red]")
+            return
+
+        console.print(f"[green]Exported to: {filepath}[/green]")
+        console.print(f"  Core blocks: {len(export_data['core'])}")
+        console.print(f"  Archival entries: {len(export_data['archival'])}")
+
+    def _memory_import(self, memory, filepath, console):
+        """Import archival entries from a JSON file produced by /memory export."""
+        import json as _json
+
+        filepath = (filepath or "").strip()
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                data = _json.load(f)
+        except FileNotFoundError:
+            console.print(f"[red]File not found: {filepath}[/red]")
+            return
+        except _json.JSONDecodeError as exc:
+            console.print(f"[red]Invalid JSON: {exc}[/red]")
+            return
+        except Exception as exc:
+            console.print(f"[red]Failed to read file: {exc}[/red]")
+            return
+
+        archival = getattr(memory, "archival", None)
+        if archival is None:
+            console.print("[yellow]Archival memory not available.[/yellow]")
+            return
+
+        # Letta's ArchivalMemory exposes ``insert``; fall back to ``add`` if a
+        # custom implementation provides it.
+        insert_fn = getattr(archival, "insert", None) or getattr(archival, "add", None)
+        if insert_fn is None:
+            console.print("[yellow]Archival memory has no insert method.[/yellow]")
+            return
+
+        imported = 0
+        for entry in data.get("archival", []) or []:
+            content = entry.get("content", "") if isinstance(entry, dict) else ""
+            if not content:
+                continue
+            metadata = entry.get("metadata") if isinstance(entry, dict) else None
+            if isinstance(metadata, str):
+                try:
+                    metadata = _json.loads(metadata)
+                except Exception:
+                    metadata = None
+            try:
+                if metadata is not None:
+                    try:
+                        insert_fn(content, metadata=metadata)
+                    except TypeError:
+                        insert_fn(content)
+                else:
+                    insert_fn(content)
+                imported += 1
+            except Exception:
+                continue
+
+        console.print(
+            f"[green]Imported {imported} archival entries from {filepath}[/green]"
+        )
+
     def _handle_cron_command(self, cmd: str):
         """Handle the /cron command to manage scheduled tasks."""
         import shlex
@@ -8808,6 +9301,8 @@ class HermesCLI:
         elif canonical == "personality":
             # Use original case (handler lowercases the personality name itself)
             self._handle_personality_command(cmd_original)
+        elif canonical == "memory":
+            self._handle_memory_command(cmd_original)
         elif canonical == "retry":
             retry_msg = self.retry_last()
             if retry_msg and hasattr(self, '_pending_input'):
@@ -8874,6 +9369,8 @@ class HermesCLI:
             self._show_usage()
         elif canonical == "insights":
             self._show_insights(cmd_original)
+        elif canonical == "billing":
+            self._handle_billing(cmd_original)
         elif canonical == "copy":
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
@@ -10548,6 +11045,141 @@ class HermesCLI:
             db.close()
         except Exception as e:
             print(f"  Error generating insights: {e}")
+
+    def _handle_billing(self, cmd: str) -> None:
+        """Handle /billing [status|history|reset] command."""
+        parts = cmd.strip().split(None, 1)
+        sub = parts[1].strip().lower() if len(parts) > 1 else "status"
+
+        db = getattr(self, "_session_db", None) or getattr(self, "session_db", None)
+        if not db or not hasattr(db, "get_wallet"):
+            self.console.print("[dim]Billing not available (no wallet database)[/dim]")
+            return
+
+        if sub == "reset":
+            self._handle_billing_reset(db)
+        elif sub == "history":
+            self._handle_billing_history(db)
+        else:
+            self._handle_billing_status(db)
+
+    def _handle_billing_status(self, db) -> None:
+        """Show TokenJuice gauge and spending summary."""
+        from rich.panel import Panel
+
+        wallet = db.get_wallet() or {}
+
+        config = getattr(self, "config", {}) or {}
+        billing_cfg = config.get("billing", {}) or {}
+        daily_limit = float(billing_cfg.get("daily_limit_usd", 5.0) or 0)
+        monthly_limit = float(billing_cfg.get("monthly_limit_usd", 50.0) or 0)
+
+        spent_today = float(wallet.get("spent_today_usd", 0.0) or 0)
+        spent_month = float(wallet.get("spent_month_usd", 0.0) or 0)
+        spent_total = float(wallet.get("spent_total_usd", 0.0) or 0)
+
+        lines = ["[bold]TokenJuice Gauge[/bold]", ""]
+
+        if daily_limit > 0:
+            daily_ratio = spent_today / daily_limit
+            daily_bar = _make_gauge_bar(daily_ratio, 20)
+            daily_pct = min(daily_ratio, 1.0) * 100
+            lines.append(
+                f"  Daily:   {daily_bar} ${spent_today:.2f}/${daily_limit:.2f} ({daily_pct:.0f}%)"
+            )
+        else:
+            lines.append(f"  Daily:   ${spent_today:.2f} (no limit)")
+
+        if monthly_limit > 0:
+            monthly_ratio = spent_month / monthly_limit
+            monthly_bar = _make_gauge_bar(monthly_ratio, 20)
+            monthly_pct = min(monthly_ratio, 1.0) * 100
+            lines.append(
+                f"  Monthly: {monthly_bar} ${spent_month:.2f}/${monthly_limit:.2f} ({monthly_pct:.0f}%)"
+            )
+        else:
+            lines.append(f"  Monthly: ${spent_month:.2f} (no limit)")
+
+        lines.append("")
+        lines.append(f"  Total spend: ${spent_total:.2f}")
+
+        last_charge = wallet.get("last_charge_at")
+        if last_charge:
+            try:
+                last = datetime.fromtimestamp(float(last_charge))
+                lines.append(f"  Last charge: {last.strftime('%Y-%m-%d %H:%M')}")
+            except (TypeError, ValueError, OSError):
+                pass
+
+        self.console.print(
+            Panel("\n".join(lines), title="[bold]Billing Status[/bold]", border_style="cyan")
+        )
+
+    def _handle_billing_history(self, db) -> None:
+        """Show last 7 days spending from sessions table."""
+        from rich.table import Table
+
+        seven_days_ago = time.time() - (7 * 86400)
+        try:
+            with db._lock:
+                rows = db._conn.execute(
+                    """SELECT
+                        date(started_at, 'unixepoch', 'localtime') AS day,
+                        COUNT(*) AS sessions,
+                        SUM(COALESCE(input_tokens, 0) + COALESCE(output_tokens, 0) +
+                            COALESCE(cache_read_tokens, 0) + COALESCE(reasoning_tokens, 0)) AS tokens,
+                        SUM(COALESCE(estimated_cost_usd, 0.0)) AS cost
+                    FROM sessions
+                    WHERE started_at >= ?
+                    GROUP BY day
+                    ORDER BY day DESC
+                    LIMIT 7""",
+                    (seven_days_ago,),
+                ).fetchall()
+        except Exception:
+            self.console.print("[dim]Could not query session history[/dim]")
+            return
+
+        if not rows:
+            self.console.print("[dim]No session history in the last 7 days[/dim]")
+            return
+
+        table = Table(title="Last 7 Days Spending", border_style="cyan")
+        table.add_column("Date", style="bold")
+        table.add_column("Sessions", justify="right")
+        table.add_column("Tokens", justify="right")
+        table.add_column("Cost", justify="right", style="green")
+
+        for row in rows:
+            day, sessions, tokens, cost = row
+            tokens_str = _format_tokens(int(tokens or 0))
+            cost_val = float(cost or 0.0)
+            cost_str = f"${cost_val:.2f}"
+            table.add_row(str(day), str(sessions), tokens_str, cost_str)
+
+        self.console.print(table)
+
+    def _handle_billing_reset(self, db) -> None:
+        """Reset daily spending counter after confirmation."""
+        from rich.prompt import Confirm
+
+        wallet = db.get_wallet() or {}
+        spent_today = float(wallet.get("spent_today_usd", 0.0) or 0)
+        self.console.print(
+            f"[yellow]Current daily spend: ${spent_today:.4f}[/yellow]"
+        )
+
+        try:
+            confirm = Confirm.ask("Reset daily counter to $0.00?", default=False)
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("[dim]Cancelled.[/dim]")
+            return
+
+        if confirm:
+            db.reset_wallet_daily()
+            self.console.print("[green]Daily counter reset.[/green]")
+        else:
+            self.console.print("[dim]Cancelled.[/dim]")
 
     def _check_config_mcp_changes(self) -> None:
         """Detect mcp_servers changes in config.yaml and auto-reload MCP connections.
@@ -13059,6 +13691,9 @@ class HermesCLI:
         # Clipboard image attachments (paste images into the CLI)
         self._attached_images: list[Path] = []
         self._image_counter = 0
+        # Reset image-wait buffer for the interactive run; controlled by
+        # config key agent.image_wait_seconds (0 = disabled).
+        self._pending_image: "tuple[str, list[Path]] | None" = None
 
         # Voice mode state (protected by _voice_lock for cross-thread access)
         self._voice_lock = threading.Lock()
@@ -14941,7 +15576,107 @@ class HermesCLI:
                             # to the outer prompt_toolkit loop and the session dies.
                             _cprint("\n[dim]Command interrupted.[/dim]")
                         continue
-                    
+
+                    # --- Image wait buffer ---
+                    # When the user submits images-only (no accompanying text),
+                    # buffer them and wait for the next text input to merge into
+                    # a single turn. agent.image_wait_seconds == 0 disables the
+                    # buffer and processes image-only turns immediately.
+                    try:
+                        _image_wait = int(
+                            (CLI_CONFIG.get("agent", {}) or {}).get("image_wait_seconds", 60)
+                        )
+                    except (TypeError, ValueError):
+                        _image_wait = 60
+
+                    if _image_wait > 0 and self._is_image_only_input(
+                        user_input if isinstance(user_input, str) else "",
+                        submit_images,
+                    ):
+                        self._pending_image = (
+                            user_input if isinstance(user_input, str) else "",
+                            list(submit_images),
+                        )
+                        _n = len(submit_images)
+                        _cprint(
+                            f"  {_DIM}📎 已收到 {_n} 张图片，等待你的文字说明... (直接回车则立即处理){_RST}"
+                        )
+                        continue
+
+                    if self._pending_image is not None:
+                        _pending_text, _pending_imgs = self._pending_image
+                        self._pending_image = None
+                        # Merge buffered images with any newly attached ones
+                        submit_images = list(_pending_imgs) + list(submit_images)
+                        _new_text = (user_input or "") if isinstance(user_input, str) else ""
+                        if _new_text.strip():
+                            # User supplied real text — use it; the images travel
+                            # via submit_images so we don't need the buffered
+                            # placeholder string.
+                            user_input = _new_text
+                        else:
+                            # Empty input → process the buffered image alone using
+                            # the original placeholder text.
+                            user_input = _pending_text
+
+                    # --- Smart reply gate ---
+                    # Short / ambiguous text-only messages get routed through an
+                    # auxiliary LLM that decides whether to reply at all. Long
+                    # messages, questions and explicit task asks bypass the gate.
+                    # Skipped entirely when the turn carries images so visual
+                    # input always reaches the agent.
+                    try:
+                        _gate_cfg = bool(
+                            (CLI_CONFIG.get("agent", {}) or {}).get("reply_gate_enabled", True)
+                        )
+                    except Exception:
+                        _gate_cfg = True
+                    if _gate_cfg and not submit_images:
+                        try:
+                            from agent.reply_gate import (
+                                needs_llm_check as _gate_needs_llm_check,
+                                build_gate_prompt as _gate_build_prompt,
+                                parse_gate_response as _gate_parse_response,
+                            )
+
+                            if isinstance(user_input, str):
+                                _gate_text = user_input
+                            elif isinstance(user_input, tuple) and user_input:
+                                _gate_text = str(user_input[0])
+                            else:
+                                _gate_text = str(user_input or "")
+
+                            if _gate_text and _gate_needs_llm_check(_gate_text):
+                                _gate_recent: list = []
+                                try:
+                                    if hasattr(self, 'conversation_history') and self.conversation_history:
+                                        _gate_recent = self.conversation_history[-6:]
+                                    elif hasattr(self, 'agent') and self.agent and hasattr(self.agent, 'messages'):
+                                        _gate_recent = self.agent.messages[-6:]
+                                except Exception:
+                                    _gate_recent = []
+
+                                _gate_prompt = _gate_build_prompt(_gate_text, _gate_recent)
+
+                                from agent.auxiliary_client import call_llm as _gate_call_llm
+                                _gate_resp = _gate_call_llm(
+                                    task="reply_gate",
+                                    messages=[{"role": "user", "content": _gate_prompt}],
+                                    max_tokens=5,
+                                    temperature=0.0,
+                                )
+                                _gate_resp_text = (
+                                    _gate_resp.choices[0].message.content
+                                    if hasattr(_gate_resp, 'choices')
+                                    else str(_gate_resp)
+                                )
+                                if not _gate_parse_response(_gate_resp_text):
+                                    _cprint(f"  {_DIM}… (silent){_RST}")
+                                    continue
+                        except Exception:
+                            # On any error fall through and let the agent reply.
+                            pass
+
                     # Expand paste references back to full content
                     _paste_ref_re = re.compile(r'\[Pasted text #\d+: \d+ lines \u2192 (.+?)\]')
                     paste_refs = list(_paste_ref_re.finditer(user_input)) if isinstance(user_input, str) else []

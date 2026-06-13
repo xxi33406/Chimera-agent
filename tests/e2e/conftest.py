@@ -211,6 +211,7 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._pending_model_notes = {}
     runner._update_prompt_pending = {}
     runner._voice_mode = {}
+    runner._image_buffers = {}
     runner._session_db = None
     runner._reasoning_config = None
     runner._provider_routing = {}
@@ -220,6 +221,7 @@ def make_runner(platform: Platform, session_entry: SessionEntry = None) -> "Gate
     runner._is_user_authorized = lambda _source: True
     runner._set_session_env = lambda _context: None
     runner._handle_message_with_agent = AsyncMock(return_value="agent-handled-default")
+    runner._reply_gate_enabled = False
     runner._should_send_voice_reply = lambda *_a, **_kw: False
     runner._send_voice_reply = AsyncMock()
     runner._capture_gateway_honcho_if_configured = lambda *a, **kw: None

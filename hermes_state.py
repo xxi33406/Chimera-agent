@@ -226,6 +226,25 @@ def _log_wal_fallback_once(db_label: str, exc: Exception) -> None:
         exc,
     )
 
+# ---------------------------------------------------------------------------
+# Wallet time-boundary helpers
+# ---------------------------------------------------------------------------
+
+def _start_of_today() -> float:
+    """Return Unix timestamp of start of today (midnight local time)."""
+    from datetime import datetime
+    today = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    return today.timestamp()
+
+
+def _start_of_month() -> float:
+    """Return Unix timestamp of start of current month."""
+    from datetime import datetime
+    now = datetime.now()
+    first = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    return first.timestamp()
+
+
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
     version INTEGER NOT NULL
@@ -292,6 +311,19 @@ CREATE TABLE IF NOT EXISTS messages (
 CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
+);
+
+CREATE TABLE IF NOT EXISTS wallet (
+    id TEXT PRIMARY KEY DEFAULT 'default',
+    balance_usd REAL NOT NULL DEFAULT 0.0,
+    spent_today_usd REAL NOT NULL DEFAULT 0.0,
+    spent_month_usd REAL NOT NULL DEFAULT 0.0,
+    spent_total_usd REAL NOT NULL DEFAULT 0.0,
+    day_reset_at REAL NOT NULL,
+    month_reset_at REAL NOT NULL,
+    last_charge_at REAL,
+    warning_sent_today INTEGER DEFAULT 0,
+    created_at REAL NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS compression_locks (
@@ -1851,6 +1883,7 @@ class SessionDB:
         codex_message_items: Any = None,
         platform_message_id: str = None,
         observed: bool = False,
+        timestamp: float = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -1882,6 +1915,10 @@ class SessionDB:
         # cannot bind list/dict parameters directly.
         stored_content = self._encode_content(content)
 
+        # 使用调用方传入的 timestamp（来自用户消息原始创建时间），
+        # 未提供时回退到 time.time()。保证向后兼容。
+        ts = timestamp if timestamp is not None else time.time()
+
         # Pre-compute tool call count
         num_tool_calls = 0
         if tool_calls is not None:
@@ -1901,7 +1938,7 @@ class SessionDB:
                     tool_call_id,
                     tool_calls_json,
                     tool_name,
-                    time.time(),
+                    ts,
                     token_count,
                     finish_reason,
                     reasoning,
@@ -4121,5 +4158,118 @@ class SessionDB:
                 "UPDATE sessions SET handoff_state = 'failed', "
                 "handoff_error = ? WHERE id = ?",
                 (error[:500], session_id),
+            )
+        self._execute_write(_do)
+
+    # =========================================================================
+    # Wallet (cost tracking)
+    # =========================================================================
+
+    def _get_or_create_wallet(self) -> dict:
+        """Get or create the default wallet row."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM wallet WHERE id = 'default'"
+            ).fetchone()
+        if row:
+            return dict(row)
+
+        now = time.time()
+        def _do(conn):
+            conn.execute(
+                """INSERT OR IGNORE INTO wallet
+                   (id, balance_usd, spent_today_usd, spent_month_usd,
+                    spent_total_usd, day_reset_at, month_reset_at,
+                    last_charge_at, warning_sent_today, created_at)
+                   VALUES ('default', 0.0, 0.0, 0.0, 0.0, ?, ?, NULL, 0, ?)""",
+                (_start_of_today(), _start_of_month(), now),
+            )
+        self._execute_write(_do)
+        # Re-read after insert
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM wallet WHERE id = 'default'"
+            ).fetchone()
+        return dict(row) if row else {}
+
+    def get_wallet(self) -> dict:
+        """Get wallet with automatic daily/monthly resets."""
+        row = self._get_or_create_wallet()
+        if not row:
+            return row
+
+        # Auto-reset daily
+        if row["day_reset_at"] < _start_of_today():
+            def _reset_day(conn):
+                conn.execute(
+                    """UPDATE wallet SET spent_today_usd = 0.0,
+                       day_reset_at = ?, warning_sent_today = 0
+                       WHERE id = 'default'""",
+                    (_start_of_today(),),
+                )
+            self._execute_write(_reset_day)
+            row = self._get_or_create_wallet()
+
+        # Auto-reset monthly
+        if row["month_reset_at"] < _start_of_month():
+            def _reset_month(conn):
+                conn.execute(
+                    """UPDATE wallet SET spent_month_usd = 0.0,
+                       month_reset_at = ? WHERE id = 'default'""",
+                    (_start_of_month(),),
+                )
+            self._execute_write(_reset_month)
+            row = self._get_or_create_wallet()
+
+        return row
+
+    def charge_wallet(self, amount_usd: float, source: str = "unknown") -> dict:
+        """Charge the wallet and return updated state."""
+        if amount_usd <= 0:
+            return self.get_wallet()
+
+        # Ensure resets are applied first
+        self.get_wallet()
+
+        now = time.time()
+        def _do(conn):
+            conn.execute(
+                """UPDATE wallet SET
+                   spent_today_usd = spent_today_usd + ?,
+                   spent_month_usd = spent_month_usd + ?,
+                   spent_total_usd = spent_total_usd + ?,
+                   last_charge_at = ?
+                   WHERE id = 'default'""",
+                (amount_usd, amount_usd, amount_usd, now),
+            )
+        self._execute_write(_do)
+        return self._get_or_create_wallet()
+
+    def reset_wallet_daily(self) -> None:
+        """Manually reset daily spending counter."""
+        def _do(conn):
+            conn.execute(
+                """UPDATE wallet SET spent_today_usd = 0.0,
+                   day_reset_at = ?, warning_sent_today = 0
+                   WHERE id = 'default'""",
+                (_start_of_today(),),
+            )
+        self._execute_write(_do)
+
+    def reset_wallet_monthly(self) -> None:
+        """Manually reset monthly spending counter."""
+        def _do(conn):
+            conn.execute(
+                """UPDATE wallet SET spent_month_usd = 0.0,
+                   month_reset_at = ? WHERE id = 'default'""",
+                (_start_of_month(),),
+            )
+        self._execute_write(_do)
+
+    def _mark_warning_sent(self) -> None:
+        """Mark that a budget warning was sent today."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE wallet SET warning_sent_today = 1 WHERE id = 'default'"
             )
         self._execute_write(_do)
